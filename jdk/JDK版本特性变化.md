@@ -104,7 +104,7 @@ Java 现行规则是"先预览、再转正",一个特性往往要预览 2~7 个�
 | `switch` 太啰嗦、忘记 break | 8.2 switch 表达式全景(12→14) |
 | 高并发下线程不够用 / 线程池调优地狱 | 15.2 虚拟线程全景(19→21) |
 | 并发任务取消、超时、异常传播难治理 | 18.3 结构化并发(预览 19→27) |
-| 隐式传参不想用 `ThreadLocal` | 19.2 Scoped Values 全景(20→25) |
+| 隐式传参不想用 `ThreadLocal` | 19.2 Scoped Values 全景(20→25);15.2.3 虚拟线程下的上下文传递 |
 | 想安全地操作堆外内存/调本地库 | 16.3 FFM API 全景(14→22) |
 | HTTP 客户端老旧、想用 HTTP/2、HTTP/3 | 5.2(11)、20.3 HTTP/3(26) |
 | 应用启动慢、内存占用高 | 4.3 CDS(10)、18.4 AOT(24)、20.4 AOT 全景、21.3 紧凑对象头(24→27) |
@@ -120,7 +120,7 @@ Java 现行规则是"先预览、再转正",一个特性往往要预览 2~7 个�
 2. **定型后的完整形态**:以最新版本视角给出可运行的完整示例。
 3. **设计原因复盘**:Java 团队每一步补丁背后要解决的真实痛点。
 
-各专题所在章节一览:CompletableFuture(6.3)、switch 表达式(8.2)、文本块(9.2)、Record(10.2)、instanceof 模式匹配(10.3)、sealed(11.2)、虚拟线程(15.2)、模式匹配全景(15.3)、SequencedCollection(15.4)、GC(15.5)、FFM(16.3)、String Templates 撤回(17.2)、Stream/Gatherers(18.2)、结构化并发(18.3,时间线更新于 21.4)、Scoped Values(19.2)、简化启动(19.3)、HTTP Client(20.3)、AOT(20.4)、Lazy Constants(20.5)、紧凑对象头(21.3)。
+各专题所在章节一览:CompletableFuture(6.3)、switch 表达式(8.2)、文本块(9.2)、Record(10.2)、instanceof 模式匹配(10.3)、sealed(11.2)、虚拟线程(15.2)、模式匹配全景(15.3)、SequencedCollection(15.4)、GC(15.5)、FFM(16.3)、String Templates 撤回(17.2)、Stream/Gatherers(18.2)、结构化并发(18.3,时间线更新于 21.4)、Scoped Values(19.2)、上下文传递与 ThreadLocal 的替代(15.2.3)、简化启动(19.3)、HTTP Client(20.3)、AOT(20.4)、Lazy Constants(20.5)、紧凑对象头(21.3)。
 
 ## 1.8 全文章节地图
 
@@ -821,6 +821,100 @@ String tricky = """
 | 15 | `formatted`, `stripIndent`, `translateEscapes` | 文本块配套 |
 | 18 | (编码相关,见 12 章 UTF-8) | — |
 
+> 本节示例均在 JDK 27 实测;`|...|` 包住内容以便看清空白,`\\n` 表示字面两个字符(反斜杠+n)。
+
+### 9.3.1 `transform`(JDK 12):链上加工,返回类型随便换
+
+**解决什么**:对字符串做一步自定义加工,链就断了,得起中间变量:
+
+```java
+String stripped = "  Java 版本特性  ".strip();
+String slug = stripped.replace(' ', '-');          // 以前:链断了两截
+```
+
+`transform` 接收 `Function<String, R>`,**返回类型 R 可以不是 String**,一路链到底:
+
+```java
+String slug = "  Java 版本特性  "
+        .transform(String::strip)
+        .transform(s -> s.replace(' ', '-'));      // 实测:|Java-版本特性|
+
+int count = "a,b,c".transform(s -> s.split(",").length);   // 实测:3(直接变 Integer)
+```
+
+适合把"清洗 → 切分 → 计数"这类中间步骤全部内联进表达式。
+
+### 9.3.2 `formatted`(JDK 15):`String.format` 的实例方法版
+
+```java
+String.format("| %-8s | %5d |%n", "订单", 42);   // 以前:模板与参数隔着方法名
+"| %-8s | %5d |%n".formatted("订单", 42);        // 现在:模板在前,参数在后,可继续链式
+// 实测输出:| 订单       |    42 |
+```
+
+真正的价值是配文本块(见 9.2)——模板保持可读的多行形态,参数收在结尾:
+
+```java
+String json = """
+        { "user": "%s", "vip": %b }
+        """.formatted("tom", true);     // { "user": "tom", "vip": true }
+```
+
+它就是 `String.format` 的换皮,性能无差别,买的是可读性/链式性。
+
+### 9.3.3 `stripIndent` / `translateEscapes`(JDK 15):文本块编译期语义的运行时化
+
+文本块在编译期做两件事:**剥离缩进**与**翻译转义**;这两个方法把这两步暴露出来,用于处理"程序化拼出来的"多行字符串(读文件、StringBuilder、`String.join` 的产物)。
+
+**`stripIndent()`:运行时版缩进剥离**:
+
+```java
+String xml = String.join("\n",
+        "        <users>",
+        "            <user>tom</user>",
+        "        </users>",
+        "    ");                        // 末行 4 空格,模拟文本块的定界符行
+xml.stripIndent().lines().forEach(l -> System.out.println("|" + l + "|"));
+```
+
+实测对照:
+
+```text
+before |        <users>|         →  after |    <users>|
+before |            <user>...|   →  after |        <user>...|
+before |        </users>|        →  after |    </users>|
+before |    |                    (末行变空行)
+```
+
+三条规则,与文本块编译语义严格一致:
+1. **最小缩进 = 各非空行与末行的最小值**——上例最小是末行的 4(不是正文的 8),所以每行只剥 4。这就是"末行代表定界符位置"的设计:定界符写在哪一列,整体就剥到哪一列;
+2. 每行的**尾随空白**被移除;
+3. **只管缩进,不碰转义**。
+
+**`translateEscapes()`:把字面转义序列变成真控制字符**——外部输入(配置/命令行/接口)里的 `\n` 通常是 `\`+`n` 两个字符,以前要手写一串 `replace` 还覆盖不全:
+
+```java
+String raw = "line1\\nline2\\tend";        // 内容里 \n、\t 均为字面两个字符
+raw.length();                              // 17,真实行数 1
+raw.translateEscapes();                    // 长度 15,真实行数 2(真换行 + 真制表符)
+"bad\\escape".translateEscapes();          // 非法转义 → IllegalArgumentException(全量校验,比手写 replace 严)
+```
+
+**组合拳 = 复刻一个文本块**:`stripIndent().translateEscapes()`。一个反直觉但正确的细节:
+
+```java
+"        hello\\n        world\n    ".stripIndent().translateEscapes()
+```
+
+```text
+    hello
+        world      ← world 前仍是 8 个空格!
+```
+
+原因:`stripIndent` 只认**真实换行**,字面 `\n` 在它眼里是普通字符——上面 `hello\n        world` 整体是"一行"。这与文本块行为一致:文本块里写 `\n` 转义**不影响**缩进计算(缩进按源码物理行算),转义最后才翻译。**顺序口诀:先剥缩进,后译转义。**
+
+其余方法实测一句话:`indent(4)` 加缩进**并保证尾随换行**(`ab` → `␣␣␣␣ab\n`,拼接时留意);`lines()` 按行返回流(`"a\nb\nc".lines().count()` → 3);`repeat(3)` → `ababab`;`strip()` 按 Unicode 空白(全角空格 U+3000 也剥),`trim()` 只认 ≤U+0020。
+
 ## 9.4 本章小结
 
 15 是"半成品收割"版本:文本块转正,ZGC/Shenandoah 转正,Record 二预览整装待发。同时它也做减法:Nashorn 移除、偏向锁默认关闭——JVM 开始为"多核 + 现代应用"重塑锁定与脚本策略。
@@ -1153,6 +1247,70 @@ boolean isVt = vt.isVirtual();
 
 > 源码坐标:`java.base/java/lang/Thread.java:1437`(`startVirtualThread`,JDK 27 源码);虚拟线程调度核心在 `java.base/java/lang/VirtualThread.java`。
 
+### 15.2.3 上下文传递:ThreadLocal 在虚拟线程时代的困境与 ScopedValue 的解法(21 → 25)
+
+**先说白话**:虚拟线程改变了"线程"的成本模型,但"线程是 ThreadLocal 的边界"这一事实没变。回答"虚拟线程下上下文怎么传"分三步:机制照旧 → 前提变了 → 官方新答案。
+
+**第一步:ThreadLocal 机制对 VT"照旧"。** 每个 Thread 对象(VT 也是 Thread)挂两张懒创建的映射:`threadLocals`(私有 ThreadLocalMap)与 `inheritableThreadLocals`(ITL,父线程有值时在**创建瞬间**逐条复制)。源码坐标:`Thread.java:330` / `:344`(JDK 27)。实测(JDK 27):
+
+```text
+vt-1 sees TL  = null           // ThreadLocal 本就线程隔离,VT 不例外
+vt-1 after set = vt-local      // 子 VT 的 set 不影响父线程
+main  TL unchanged = platform-root
+vt-2 sees ITL = ctx-v1         // ITL:创建瞬间复制父线程当前值
+vt-3 sees ITL = ctx-v2         // 每次新建 VT 都重新复制一遍
+```
+
+**第二步:变的是前提,不是机制。** 平台线程时代靠"线程池复用"摊销 ThreadLocal 成本——set 一次,几千个任务共享。虚拟线程"一任务一线程"后:
+
+1. **摊销消失**:每个请求新建 VT,ITL 有值就得逐条复制,ThreadLocalMap 跟着百万级线程对象进堆;
+2. **可变污染依旧**:任何下游代码都能 `set` 改写上下文,排查极难;
+3. **生命周期不受控**:ITL 复制出的值"跟着线程活",与结构化并发的任务树生命周期模型相悖;
+4. 相对的好消息:VT 不池化,任务结束线程即亡,"忘 remove"式的累积泄漏自动缓解——所以 JEP 444 也承认 ThreadLocal 在 VT 上"通常可用"。
+
+**第三步:虚拟线程下应该怎么实现?分两段答:**
+
+- **JDK 21~24(ScopedValue 尚预览)**:ThreadLocal/ITL 仍是可用过渡方案(ITL 别放大对象;跨线程池传递可用 Micrometer context-propagation 等库级快照);
+- **JDK 25+(推荐)**:**ScopedValue(JEP 506 转正)就是官方为此准备的答案**:不可变绑定、生命周期被 `where(...).run/call` 作用域硬约束、与结构化并发子任务自动继承。
+
+**ScopedValue 的继承机制——两个实测确认的关键点**(源码坐标 JDK 27):
+
+1. **继承只走结构化作用域**。Thread 用一个字段保存当前绑定链(`Thread.java:357` `scopedValueBindings`),线程启动时经 `inheritScopedValueBindings`(`Thread.java:381`)从 **ThreadContainer**(即 StructuredTaskScope 的容器)捕获绑定快照,并做绑定变化检测(不一致抛 `StructureViolationException`,`Thread.java:389`)。**直接 `new Thread` / `Thread.ofVirtual()` 创建的子线程拿不到绑定**——JDK 21 与 27 实测行为一致,子线程 `get()` 直接抛 `NoSuchElementException: ScopedValue not bound`(`ScopedValue.java:577`);而结构化作用域内 fork 的子任务能正常读到:
+
+```java
+// 实测(JDK 27):继承的"唯一正门"是结构化作用域
+ScopedValue.where(USER, "in-scope").run(() -> {
+    try (var scope = StructuredTaskScope.open()) {
+        var st = scope.fork(() -> "hello, " + USER.get());   // 子任务自动继承绑定
+        scope.join();
+        System.out.println(st.get());                        // hello, in-scope
+    }
+});
+```
+
+2. **作用域结束,值即"收回"**。实测让子线程睡 300ms、父作用域先行结束,子线程再 `get()` 依旧抛 `NoSuchElementException`——绑定不是"复制给你",而是"共享给你,但你必须在我的结构里读"。这正是"结构化"的含义:**值的可见性生命周期 = 作用域的生命周期**,与 ITL 的"复制出去就管不着"形成根本区别。
+
+**按场景选型**:
+
+| 场景 | 推荐方案 |
+|------|----------|
+| 单个虚拟线程内传上下文(一请求一线程的常见形态) | `ScopedValue.where(...).run/call`(25 起) |
+| 任务扇出:父子任务共享上下文 | `ScopedValue` + `StructuredTaskScope.fork`(继承唯一通道) |
+| 遗留平台线程池 | `ThreadLocal`/ITL 或 context-propagation 快照库 |
+| 21~24 无法升级时的跨线程传递 | ITL(慎放重对象)/ 库级快照 |
+
+三者的机制对比:
+
+| 维度 | ThreadLocal | InheritableThreadLocal | ScopedValue(25 转正) |
+|------|-------------|------------------------|----------------------|
+| 可变性 | `set` 随意 | `set` 随意 | 不可变,重绑 = 新作用域 |
+| 生命周期 | 到 remove / 线程死 | 复制后跟随子线程 | 严格限于 run/call 作用域 |
+| 传给子线程 | 不传 | 创建时逐条复制 | 仅结构化作用域内共享快照 |
+| 越界读取 | 读到旧值(难排查) | 读到复制值 | 直接抛 `NoSuchElementException` |
+| 与虚拟线程亲和 | 差(无池化摊销) | 差(逐请求复制) | 好(Loom 协同设计,绑定链共享免复制) |
+
+**一句话结论**:是的——虚拟线程时代的上下文传递,官方答案就是 25 转正的 ScopedValue,但它的继承被刻意收窄为"只认结构化作用域"(越界即异常);21~24 的过渡期继续用 ThreadLocal/ITL 可行,跨池场景配库级快照。API 级全景与源码坐标见 19.2。
+
 ## 15.3 【跨版本演进专题】模式匹配全景:16 → 21
 
 ### 15.3.1 演进时间线
@@ -1420,39 +1578,115 @@ Stream.of(1,1,2,2,3,1).gather(distinctAdjacent).toList();  // [1,2,3,1]
 
 **为什么值得转正专章**:Gatherers 与 21 的模式匹配一样,是把"语言/库从封闭走向开放"的一步——此后流式数据处理的自定义变换有了官方插座,`Collectors` 时代的"收集器魔法"被大大稀释。
 
-## 18.3 【专题】结构化并发重新设计:19 → 24(Joiner 模型)
+## 18.3 【专题】结构化并发:解决什么、怎么用、如何演进(19 → 27)
 
-**白话**:结构化并发要解决的是"并发任务的生命周期失控":fork 出去的子任务,谁负责取消?超时了谁停?异常了谁收尸?它的答案是**任务树**:子任务的生命周期严格嵌套在父作用域内,作用域退出 = 全部收束。
+**白话**:一句话——**把并发任务的生命周期重新关进方法的语法结构里**。fork 出去的子任务,谁负责取消?超时了谁停?异常了谁收尸?结构化并发的答案是**任务树**:子任务的生命周期严格嵌套在父作用域内,作用域退出 = 全部收束(完成/取消/失败,没有第四种状态)。
+
+### 18.3.1 它到底解决什么问题
+
+**类比**:五十年前 Dijkstra 用"结构化编程"消灭 goto——控制流必须单入口单出口,代码块构成树。今天的并发正处在"goto 时代":`submit`/`fork` 出去的任务与提交它的代码块**没有任何语法从属关系**,四件事全靠人肉做对,漏一件就是生产事故:
+
+| # | 非结构化时代必须手工做对的事 | 漏掉的后果 |
+|---|------------------------------|-----------|
+| 1 | 等待:逐个 `future.get`,自己排顺序、设超时 | 少等一个 → 结果丢失;全等 → 一个卡死拖垮全部 |
+| 2 | 取消:失败/超时后记住每个 future 并逐个 `cancel` | **任务泄漏**:请求早已失败,子任务还在烧 CPU/连接/下游配额 |
+| 3 | 异常:并行分支的异常谁收? | 吞掉,或躺在没人 `get` 的 future 里 |
+| 4 | 观测:线程 dump 里哪批线程属于哪个请求? | 无法归因,排障靠猜 |
+
+**对比:同一个"聚合两个远程调用"需求**
+
+```java
+// 非结构化(线程池):四件事全手工
+var pool = Executors.newFixedThreadPool(2);          // ① 池的生命周期与请求脱钩
+var user   = pool.submit(() -> fetchUser(id));
+var orders = pool.submit(() -> fetchOrders(id));
+try {
+    return new Response(user.get(1, SECONDS), orders.get(1, SECONDS));   // ② 手工等待
+} catch (TimeoutException e) {
+    user.cancel(true); orders.cancel(true);          // ③ 手工取消(漏一个就泄漏;orders 的异常没人收 ④)
+    throw e;
+} finally {
+    pool.shutdown();
+}
+
+// 结构化:四件事全部交给作用域
+try (var scope = StructuredTaskScope.open()) {       // 作用域 = 任务树的根
+    var user   = scope.fork(() -> fetchUser(id));
+    var orders = scope.fork(() -> fetchOrders(id));
+    scope.join();                                    // 全成功才返回;任一失败 → 兄弟任务自动取消
+    return new Response(user.get(), orders.get());
+}   // 离开 try 块前,所有子任务必然已收束
+```
+
+**"自动取消"不是口号,实测**(JDK 27,`--enable-preview`):慢任务睡 3s,兄弟任务 100ms 失败——
+
+```text
+慢任务在 123ms 被中断 —— 兄弟任务失败触发了自动取消
+join 在 160ms 抛出 ExecutionException, 原因 = java.lang.IllegalStateException: 上游服务 503
+total 160ms —— 没等到 3000ms,整棵任务树已收束
+```
+
+取消沿任务树**自动向下传播**,异常沿树**自动向上收拢**——这就是"结构化"二字的全部含义。
+
+### 18.3.2 典型使用场景(场景 → Joiner/配置 一览)
+
+| 场景 | 用法(JDK 27 形态) | join() 的返回/抛出 |
+|------|--------------------|--------------------|
+| 扇出聚合:并行调多个服务,全成功才继续 | `open()`(默认策略) | 返回 null,用 `Subtask::get` 取结果;任一失败 → 取消其余并抛 ExecutionException |
+| 全成功并直接收集结果 | `open(Joiner.allSuccessfulOrThrow())` | 返回 `List<T>` |
+| 竞速/对冲:多镜像谁快用谁 | `open(Joiner.anySuccessfulOrThrow())` | 返回第一个成功结果,其余被取消 |
+| 只求"全部跑完"(成败都要) | `open(Joiner.awaitAllSuccessfulOrThrow())` | 返回 null,事后按 `Subtask.state()` 分拣 |
+| 整树统一截止时间 | `open(joiner, cf -> cf.withTimeout(Duration.ofSeconds(10)))` | 超时 → 取消全部,join 抛 ExecutionException(cause = `CancelledByTimeoutException`) |
+| 自定义停止条件(如"成功 3 个就停") | `open(Joiner.allUntil(predicate))` | 返回 `List<Subtask<T>>` |
+
+两点注意:① 超时是 **scope 级**配置(27 新增 `Configuration`),语义是"到点**取消**所有子任务",而不是"不等了但任务继续跑";② 子任务默认跑在**虚拟线程**上(可用 `withThreadFactory` 覆盖),与 15.2 是配套设计。
+
+### 18.3.3 演进时间线:19 → 27
 
 | 版本 | 变化 | 为什么要变 |
 |------|------|-----------|
 | 19/20 孵化(428/437) | `new StructuredTaskScope.ShutdownOnFailure()`,先 fork 后 join,`throwIfFailed()` | 初版概念验证:scope + 关闭时强制收束 |
-| 21 预览(453)~ 23 预览三 | API 打磨 | 发现初版 API" fork/join 顺序、异常策略"组合过于松散,易用错 |
-| **24 预览四(499):重新设计** | **`StructuredTaskScope.open()` + `Joiner` 策略对象**:`open()` 默认"全部成功或抛 ExecutionException";`open(Joiner.anySuccessfulOrThrow())` 任一成功;`open(Joiner.awaitAll())` 全等;`allUntil(predicate)` 自定义取消条件;`join()` 返回值直接携带结果 | 把"等待策略"从隐式约定变成**显式策略参数**,API 面更小、更难用错;join 的返回值直接是策略产物,少一次 get |
-| 25(505)/ 26(525)/ **27(533)** | 第五/六/七次预览 | 仍在打磨,**截至 27 未转正** |
+| 21~23 预览(453/462/480) | API 打磨 | "fork/join 顺序、异常策略"组合过于松散,易用错 |
+| **24 预览四(499):重新设计** | **`open()` + `Joiner` 策略对象**;join() 返回值直接携带策略产物 | 把"等待策略"从隐式约定变成显式策略参数,API 面更小、更难用错 |
+| 25(505) | 公共构造器改为静态工厂 `open()` | 收紧构造面,统一入口 |
+| 26(525) | 小幅调整 | — |
+| **27(533)** | **`Configuration` API**:`open(joiner, cf -> cf.withTimeout(...))` 可配超时/名字/线程工厂;`join()` 的受检异常类型参数化(`R_X`);移除 `awaitAll()`(并入 `awaitAllSuccessfulOrThrow`);`onTimeout()` → `timeout()` | 截止时间/命名此前只能手工,收进 scope 配置;第七次预览,**仍未转正** |
+
+### 18.3.4 定型后的完整形态(JDK 27,需 --enable-preview)
 
 ```java
-// JDK 24+ 形态(27 仍需 --enable-preview;Subtask/Joiner 是 StructuredTaskScope 的嵌套类型)
+// ① 默认策略:全成功或抛(等待+取消+异常三合一;Subtask/Joiner 是 StructuredTaskScope 的嵌套类型)
 <T> List<T> gatherAll(List<Callable<T>> tasks) throws Exception {
-    try (var scope = StructuredTaskScope.open()) {              // 默认:全成功或抛
+    try (var scope = StructuredTaskScope.open()) {
         List<Subtask<T>> handles = tasks.stream().map(scope::fork).toList();
         scope.join();                                            // 任一失败 → 其余被取消,抛 ExecutionException
         return handles.stream().map(Subtask::get).toList();
     }
 }
 
-// 任一成功(对冲多个镜像服务):拿第一个成功结果,取消其余
+// ② 竞速:任一成功即用,取消其余
 String bestMirror() throws Exception {
     try (var scope = StructuredTaskScope.open(Joiner.<String>anySuccessfulOrThrow())) {
-        scope.fork(() -> fetchFromMirrorA());
-        scope.fork(() -> fetchFromMirrorB());
-        return scope.join();                                     // join 直接返回第一个成功的结果
+        scope.fork(this::fetchFromMirrorA);
+        scope.fork(this::fetchFromMirrorB);
+        return scope.join();                                     // 直接返回第一个成功结果
+    }
+}
+
+// ③ 全成功收集 + 整树 100ms 截止时间(27 的 Configuration;实测 cause = CancelledByTimeoutException)
+List<String> withinDeadline() throws Exception {
+    try (var scope = StructuredTaskScope.open(
+            Joiner.<String>allSuccessfulOrThrow(),
+            cf -> cf.withTimeout(Duration.ofMillis(100)))) {
+        scope.fork(() -> { Thread.sleep(5000); return "slow"; });
+        scope.fork(() -> "fast");
+        return scope.join();
     }
 }
 ```
 
-> 源码坐标(JDK 27):`java.base/java/util/concurrent/StructuredTaskScope.java:1268`(`open()`)、`:572`(`Joiner` 接口)、`:750/839/931`(allSuccessfulOrThrow/anySuccessfulOrThrow/awaitAllSuccessfulOrThrow)、`:1344/1367`(`fork`)。
-> 时间线将持续更新:见 21.4(27 的第七预览)。
+> 源码坐标(JDK 27):`java.base/java/util/concurrent/StructuredTaskScope.java:1268`(`open()`)、`:572`(`Joiner` 接口)、`:750/839/931/1024`(allSuccessfulOrThrow/anySuccessfulOrThrow/awaitAllSuccessfulOrThrow/allUntil)、`:1344/1367`(`fork`)。
+> 时间线后续更新见 21.4。**生产提示**:27 仍为预览特性;生产上的近似替代 = 虚拟线程 + `try-with-resources` 包裹 + 亲手传播取消(即 18.3.1 的非结构化写法在 VT 上的改良版)。
 
 ## 18.4 AOT 类加载与链接(483):启动优化的新引擎
 
@@ -1526,6 +1760,8 @@ boolean bound = CURRENT_USER.isBound();
 2. **有界生命周期**:离开 `run/call` 自动失效,不存在忘 remove;
 3. **与虚拟线程亲和**:结构化并发的子任务继承父作用域绑定,无需逐线程复制;
 4. **性能**:绑定/读取路径为 Loom 优化,百万虚拟线程下远胜 ThreadLocal 复制。
+
+> **继承边界(实测,JDK 21 与 27 行为一致)**:ScopedValue 绑定**只**继承给结构化作用域内的子任务(`StructuredTaskScope.fork`);直接 `new Thread` / `Thread.ofVirtual()` 创建的子线程读绑定会抛 `NoSuchElementException`,作用域结束后再读同样抛出——机制与实测过程见 15.2.3。
 
 > 源码坐标(JDK 27):`java.base/java/lang/ScopedValue.java:529`(`where`)、`:466`(`Carrier.run`)、`:555`(`get`)、`:504`(`CallableOp`)。
 
@@ -1705,14 +1941,15 @@ public class Component {
 
 ## 21.4 结构化并发时间线更新:19 → 27(第七次预览)
 
-完整机制与 24 重设计的 API 见 18.3。演进全表:
+完整机制、问题剖析与 27 形态 API 见 18.3。演进全表:
 
 | 版本 | JEP | 状态 |
 |------|-----|------|
 | 19 / 20 | 428 / 437 | 孵化一、二 |
 | 21 / 22 / 23 | 453 / 462 / 480 | 预览一、二、三 |
 | 24 | 499 | **预览四:open()/Joiner 重新设计** |
-| 25 / 26 / **27** | 505 / 525 / 533 | 预览五、六、**七(仍未转正)** |
+| 25 / 26 | 505 / 525 | 预览五、六(25 起 `open()` 静态工厂取代公共构造器) |
+| **27** | 533 | 预览七(仍未转正);新增 **`Configuration`**(scope 级超时/命名/线程工厂)、`join()` 异常类型参数化、移除 `awaitAll()`——详见 18.3.3 |
 
 **为什么七年未转正**:它要同时满足"取消语义正确、异常不吞、与虚拟线程零摩擦、API 难用错"四条硬标准,每轮预览都还能收到设计级反馈。对照 String Templates(撤回),可见 Java 对"转正即永久"承诺的谨慎程度。
 
