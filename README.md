@@ -12,7 +12,8 @@
 | `k8s/` | 容器编排 | Kubernetes 整体架构详解、iptables 原理及其在 K8s 中的应用 |
 | `cncf/` | 云原生生态 | CNCF 关键项目全景、Cilium / IPVS / OpenTelemetry 系列深度指南（规范、Java 源码、Java Agent 与 SpringBoot 实战） |
 | `harness/` | AI 基础设施 | 向量数据库原理详解 |
-| `linux/` `mq/` `tools/` | 规划中 | 待补充 |
+| `mq/` | 消息中间件 | RocketMQ 深度源码解析（基于 rocketmq 5.5.x 源码，含"消息不丢、不重"可靠性专题） |
+| `linux/` `tools/` | 规划中 | 待补充 |
 
 ## ✍️ 文档特色
 

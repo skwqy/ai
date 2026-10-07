@@ -142,6 +142,7 @@ Reactor 的依赖图比 Spring 还要"骨感"，`reactor-core/build.gradle` 中�
 | 异步代码不好测：时序不定、时间不可控 | StepVerifier 计划式验证 + VirtualTimeScheduler 虚拟时钟 | 第九章 |
 | 观测（指标/链路）如何无侵入接入反应式流 | `reactor.core.observability` SignalListener + `tap()` + micrometer 模块 | 第九章 |
 | 重试要退避（backoff）、要抖动、要有上限 | `util.retry` 包的 `Retry`/`RetryBackoffSpec` 规范 | 第六章 |
+| 与 JDK 原生流式 API（HttpClient、SubmissionPublisher）互通 | `reactor.adapter.JdkFlowAdapter` 双向适配：RS ↔ Flow 七方法同构、一身二职 | 第二章 |
 
 ## 1.6 版本演进：从 1.x 到 3.8 的关键变化
 
@@ -317,17 +318,179 @@ public interface CorePublisher<T> extends Publisher<T> {
 
 **`Long.MAX_VALUE` 的特殊语义**：它不是"要这么多"，而是"无界需求"。此后上游可以随意推送，request 累计数饱和于 `MAX_VALUE`。Reactor 中 `subscribe()`（无参）默认就走这条路——`LambdaSubscriber.onSubscribe` 中的 `s.request(Long.MAX_VALUE)`（`reactor-core/src/main/java/reactor/core/publisher/LambdaSubscriber.java` 第 123 行）。这就是为什么很多人"订阅了却觉得背压没用"：**不是没用，是你选择了无界需求**。
 
-## 2.4 JDK 9 的 Flow API 与 Reactor 的关系
+## 2.4 JDK 9 的 Flow API 与 Reactor 的关系：详细分析
 
-JDK 9 把 Reactive Streams 的四个接口原样搬进了 `java.util.concurrent.Flow`（`Flow.Publisher`/`Flow.Subscriber`/`Flow.Subscription`/`Flow.Processor`），只是**搬了接口，没有提供实现**。JDK 类库自己的响应式能力（`SubmissionPublisher`）只算一个演示级发布者。
+> 本节引用的 JDK 侧证据来自 openjdk/jdk 仓库主线的 `src/java.base/share/classes/java/util/concurrent/Flow.java`（2026-10-06 抓取的快照，逐字引用），并与 Oracle JDK 17 API 文档交叉核对。
 
-Reactor 刻意**继续使用 `org.reactivestreams` 类型而非 `Flow` 类型**——因为 `Flow` 接口在语义上与 RS 完全一致，二者只差命名空间；而 RS 类型允许 Reactor 在 Java 8 上运行（3.8 的主源码仍是 Java 8 基线，见 1.6.1 节）。需要与 `Flow` 世界互通时，靠适配器（`reactor.adapter.JdkFlowAdapter`，`reactor-core/src/main/java/reactor/adapter/JdkFlowAdapter.java`，属于 `reactor.adapter` 包，包内共 2 个文件）互转即可。
+### 2.4.1 历史脉络：社区规范如何"进宫"
+
+时间线很紧凑：
+
+1. **2013~2015**：Netflix（RxJava）、Pivotal（Reactor）、Lightbend（Akka Streams）等组成工作组起草响应式流规范；2015 年 4 月发布 **Reactive Streams 1.0**（reactive-streams-jvm），含四接口 + TCK。
+2. **2017-09**：JDK 9 把四个接口原样收编为 `java.util.concurrent.Flow` 的嵌套接口。执笔人不是别人，正是 JSR-166（`java.util.concurrent` 包）的主持人 Doug Lea——Flow.java 的版权头写得很清楚：
+
+    ```
+    Written by Doug Lea with assistance from members of JCP JSR-166
+    Expert Group and released to the public domain
+    ```
+
+   Flow 的类级 Javadoc 也自报了血统（openjdk/jdk 主线 Flow.java 原文）：
+
+   > "These interfaces correspond to the reactive-streams specification."
+
+3. **但是 Flow 只是 API，不是实现**。JDK 自带的唯一 `Flow.Publisher` 实现是 `java.util.concurrent.SubmissionPublisher`——一个"自带缓冲、可配 executor 的多播发布器"，没有任何操作符。在 Flow 世界里想要 `map`/`flatMap`/`retryWhen`，你仍然需要 Reactor、RxJava 或 Mutiny。**Flow 收编的是"合同"，真正"干活的车间"还是这些第三方库**——这也是它对本章主题的意义：Reactor 与 Flow 不是竞争关系，而是"实现 ↔ 官方 API 副本"的关系。
+
+两个值得原文品读的 Javadoc 细节，与本章前文一一呼应：
+
+> "All (seven) methods are defined in void 'one-way' message style."
+
+——七个方法（subscribe/onSubscribe/onNext/onError/onComplete/request/cancel）全是 void 单向消息，与 1.2 节"六个信号走天下"完全一致。
+
+> "Publishers ensure that Subscriber method invocations for each subscription are strictly ordered in happens-before order."
+
+——信号串行性（规范规则 1.3，见 2.3 节）同样写进了 JDK 文档；8.4 节 Sinks 的 `FAIL_NON_SERIALIZED` 在两个世界里都是这条红线。
+
+### 2.4.2 类型对照：七个方法，两个命名空间
+
+| org.reactivestreams（RS 1.0.4） | java.util.concurrent.Flow | 差异 |
+|---|---|---|
+| `Publisher<T>` | `Flow.Publisher<T>` | Flow 版标注了 `@FunctionalInterface`（RS 版没有） |
+| `Subscriber<T>` | `Flow.Subscriber<T>` | 完全同构（方法签名逐一相同） |
+| `Subscription` | `Flow.Subscription` | 完全同构 |
+| `Processor<T,R>` | `Flow.Processor<T,R>` | 完全同构 |
+| reactive-streams-tck 1.0.4（合规验证） | 无 TCK | TCK 只存在于 RS 侧，JDK 不提供 |
+
+【源码证据】Reactor 侧的规范依赖版本与 TCK——`gradle/libs.versions.toml` 第 13、49 行：
+
+```toml
+reactiveStreams = "1.0.4"
+...
+reactiveStreams-tck = { module = "org.reactivestreams:reactive-streams-tck", version.ref = "reactiveStreams" }
+```
+
+**"默认批量"的平行魔数**是两个世界最有趣的暗合：Flow 类唯一的一个静态方法 `defaultBufferSize()` 返回 **256**（openjdk/jdk 主线源码：`static final int DEFAULT_BUFFER_SIZE = 256;`，@implNote *"The current value returned is 256"*）——与 Reactor 的 `Queues.SMALL_BUFFER_SIZE = 256`（4.2 节）同值同义，都是"发布者/订阅者缓冲的默认水位"。Flow 的类 Javadoc 还给出了示例订阅者的补货策略：**消费过半就补**（示例中 bufferSize=64，把未满足需求维持在 32~64 之间）——与 Reactor 的 `unboundedOrLimit` 75% 水位补货（4.3 节）是同一思想的两种工程取值。注意 Flow 的**公共 API 里没有**"批量"维度的方法，Javadoc 示例里出现的 32 只是示例代码的取值，不要与 Reactor 的 `XS_BUFFER_SIZE=32`（系统属性可调）混为一谈。
+
+### 2.4.3 Reactor 的立场：为什么坚持 org.reactivestreams
+
+既然语义完全等价，Reactor 为什么不直接用 `Flow` 类型？四个理由，全部有仓库内证据：
+
+1. **Java 8 基线**。`Flow` 是 JDK 9+ API，而 Reactor 3.8 的主源码仍以 Java 8 编译（`reactor-core/build.gradle` 第 141 行 `languageVersion = JavaLanguageVersion.of(name == "docs" ? 21 : 8)`，见 1.6.1 节）——用 RS 类型才能兑现"一个 jar 跑遍 Java 8~25"的兼容承诺。
+2. **生态中立**。RS 是跨库最小公约数：RxJava、Mutiny、Akka Streams 都在 RS 世界。Reactor 的操作符按 3.2 节的约定接受裸 `Publisher`，任何一个 RS 实现都能直接喂进来——这是"实现库之间互不锁定"的前提。
+3. **规范即契约**。TCK 依赖（上表）证明 Reactor 接受 1.0.4 规范合规验证；若绑定 `Flow`，这条合规链就断了（JDK 侧无 TCK）。
+4. **零收益的迁移**。接口逐方法同构，改名没有任何语义或性能收益。
+
+这条立场的"物理证据"可以用 grep 验证：**reactor-core 主源码 443 个文件中，唯一 import `java.util.concurrent.Flow` 的就是适配器 `reactor/adapter/JdkFlowAdapter.java`**——Reactor 内核与 Flow 零耦合，互通被隔离在 2 个文件（adapter 包：`JdkFlowAdapter.java` + `package-info.java`）里。
+
+### 2.4.4 适配器 JdkFlowAdapter 全解剖：一身二职的桥墩
+
+适配器总共 179 行、两个入口，方向相反：
+
+| 方法 | 行号 | 方向 |
+|---|---|---|
+| `publisherToFlowPublisher(Publisher<T>)` | 第 44-47 行 | RS → Flow（Reactor/任意 RS 实现供给 JDK 世界） |
+| `flowPublisherToFlux(Flow.Publisher<T>)` | 第 56-58 行 | Flow → Reactor |
+
+实现精髓是"**一身二职**"——桥上每个适配对象同时实现两边的两个角色：
+
+【源码证据】`reactor-core/src/main/java/reactor/adapter/JdkFlowAdapter.java` 第 91-105 行（`FlowSubscriber`，RS→Flow 方向的内核）：
+
+```java
+	private static class FlowSubscriber<T> implements CoreSubscriber<T>, Flow.Subscription {
+
+		private final Flow.Subscriber<? super T> subscriber;
+
+		Subscription subscription;
+
+		@Override
+		public void onSubscribe(final Subscription s) {
+		    this.subscription = s;
+			subscriber.onSubscribe(this);          // 把"自己"当作 Flow.Subscription 递给 JDK 世界
+		}
+
+		@Override
+		public void onNext(T o) {
+			subscriber.onNext(o);                  // 数据信号：纯转发
+		}
+		...
+		@Override
+		public void request(long n) {
+		    subscription.request(n);               // 需求信号：打回 RS 上游
+		}
+```
+
+它站在 RS 世界当 `Subscriber`（收 RS 上游的信号），却把 **`this` 当作 `Flow.Subscription`** 递给 JDK 世界的订阅者——于是 JDK 侧的 `request/cancel` 会打回它身上，再转手调真正的 RS `Subscription`。反方向的 `SubscriberToRS`（第 134-175 行）严格对称（实现 `Flow.Subscriber` + RS `Subscription`）。
+
+三个特性值得注意：
+
+- **零成本翻译**：没有队列、没有缓存、没有线程切换——信号逐个直通，适配器是"海关"不是"加工厂"；
+- **不产生 Context**：`FlowSubscriber` 没有覆写 `currentContext()`，返回默认 `Context.empty()`（7.3 节）——Flow 世界天然没有 Context 概念，过桥即清零；
+- **没有 Mono 版本**：`flowPublisherToFlux` 只能返回 `Flux`——`Flow.Publisher` 的语义就是 0..N，"至多一个"的基数知识在过桥时丢失（想保住 Mono 语义得在上层重新 `next()`/`single()`）。
+
+### 2.4.5 双向互通的真实战场：Spring WebClient ↔ JDK HttpClient
+
+这不是纸上谈兵——Spring Framework 7.1.0-SNAPSHOT 的 `spring-web` 模块在 JDK HttpClient 连接器（`JdkClientHttpConnector`）里**每个请求都在双向过桥**：
+
+**入站（JDK → Reactor）**：JDK `HttpResponse.BodyHandlers.ofPublisher()` 交给应用的响应体类型是 `Flow.Publisher<List<ByteBuffer>>`，Spring 转成 Flux 再拆包：
+
+【源码证据】`spring-framework/spring-web/src/main/java/org/springframework/http/client/reactive/JdkClientHttpResponse.java` 第 68-80 行：
+
+```java
+		HttpResponse<Flow.Publisher<List<ByteBuffer>>> response, DataBufferFactory bufferFactory) {
+
+		Flow.Publisher<List<ByteBuffer>> body = response.body();
+		if (body == null) {
+			return Flux.empty();
+		}
+
+		return JdkFlowAdapter.flowPublisherToFlux(body)
+				.flatMapIterable(Function.identity())
+				.map(bufferFactory::wrap)
+				...
+	}
+```
+
+**出站（Reactor → JDK）**：请求体在 Spring 这边是 `Flux/Mono<DataBuffer>`，转换后喂给 `HttpRequest.BodyPublishers.fromPublisher`（它只认 `Flow.Publisher`）：
+
+【源码证据】`spring-framework/spring-web/src/main/java/org/springframework/http/client/reactive/JdkClientHttpRequest.java` 第 109-120 行：
+
+```java
+	private HttpRequest.BodyPublisher toBodyPublisher(Publisher<? extends DataBuffer> body) {
+		Publisher<ByteBuffer> byteBufferBody = (body instanceof Mono ?
+				Mono.from(body).map(this::toByteBuffer) :
+				Flux.from(body).map(this::toByteBuffer));
+
+		Flow.Publisher<ByteBuffer> bodyFlow = JdkFlowAdapter.publisherToFlowPublisher(byteBufferBody);
+
+		return (getHeaders().getContentLength() > 0 ?
+				HttpRequest.BodyPublishers.fromPublisher(bodyFlow, getHeaders().getContentLength()) :
+				HttpRequest.BodyPublishers.fromPublisher(bodyFlow));
+	}
+```
+
+互通姿势速查：**JDK 世界的发布者**（`HttpClient` 响应体、`SubmissionPublisher`、任何第三方返回的 `Flow.Publisher`）用 `flowPublisherToFlux` 收编进 Reactor 流水线；**Reactor 的流要交给只认 `Flow.Publisher` 的 API**（`BodyPublishers.fromPublisher`、自研的 JDK 风格组件）时用 `publisherToFlowPublisher` 送出去。
+
+一张图收拢：
+
+```
+      RS 世界（2015 规范）                        JDK 世界（2017 收编）
+ org.reactivestreams.*                      java.util.concurrent.Flow.*
+ Publisher      ◄── 七方法同构 ──►          Flow.Publisher
+ Subscriber     ◄── 七方法同构 ──►          Flow.Subscriber
+ Subscription   ◄── 七方法同构 ──►          Flow.Subscription
+ Processor      ◄── 七方法同构 ──►          Flow.Processor
+      ▲                                              ▲
+      │  reactor.adapter.JdkFlowAdapter（一身二职）    │
+      │            Flux ◄──────────► Flow.Publisher   │
+      └── Reactor（有操作符、有 TCK、有 Context）      └── SubmissionPublisher/HttpClient
+                                                          （有 API、无操作符、无 TCK）
+```
 
 ## 2.5 本章小结
 
 - Reactive Streams 用**四个接口**定义了"带背压的异步流"的最小合同：`Publisher`（可被订阅）、`Subscriber`（信号接收方）、`Subscription`（request/cancel 遥控器）、`Processor`（既收又发的中间件）。
 - **背压的本体是 `Subscription.request(n)`**：它是下游对上游唯一的节奏控制手段，`Long.MAX_VALUE` 即无界需求。
 - 规范只定义合同不定义实现；Reactor 是这套合同上最主流的生产级实现，并通过 TCK（reactive-streams-tck 1.0.4）验证。
+- `Flow`（JDK 9）是这套规范的官方收编副本：四接口逐方法同构、默认缓冲同值 256；但 Flow 只收编了 API 没有实现（JDK 唯一的 `SubmissionPublisher` 无操作符）。Reactor 坚持使用 RS 类型（Java 8 基线 + 生态中立 + TCK 合规），与 Flow 的全部互通被隔离在 `reactor.adapter.JdkFlowAdapter` 一个类里（2.4 节）。
 - Reactor 的全部扩展（`CorePublisher`/`CoreSubscriber`）都围绕两件事：**传 Context** 与 **绕过钩子的内部快速通道**，从不突破六信号模型。
 - 下一章进入 Reactor 自己的世界：`Flux`/`Mono` 这两个" Publisher 子类 + 几百个操作符"的类，到底是怎么组织起来的。
 
