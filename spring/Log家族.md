@@ -126,7 +126,7 @@
 第四章 Log4j2        —— 现代实现：api/core 双轨、Logger/LoggerConfig 分离、Disruptor、插件体系
 第五章 遗产三兄弟     —— Log4j1 / JUL / JCL 的设计、价值与死因
 第六章 桥接矩阵       —— 全家桶怎么拼、死循环陷阱、Spring Boot 默认配方
-第七章 使用指南       —— 从零搭建两种栈的完整配置与代码规范 + 配置文件语法全解
+第七章 使用指南       —— 从零搭建两种栈的完整配置与代码规范 + 配置文件全解 + Marker/TurboFilter 落地实战
 第八章 贯通视图       —— 两条时间线、选型决策树、面试十连
 第九章 附录          —— 类速查表、系统属性速查、依赖坐标、排错清单
 ```
@@ -1822,13 +1822,447 @@ log4j.appender.daoFile.MaxBackupIndex=10
 - **脚本/工具/单测**：`slf4j-simple` + `-D` 系统属性零文件起步，或 `slf4j-nop` 全静音。
 - **调试配置加载本身**：logback 用 `debug="true"` 或 `<statusListener>`；log4j2 用 `status="DEBUG"` / `-Dlog4j2.debug`（4.12 节）。
 
-## 7.6 本章小结
+## 7.6 Marker 与 TurboFilter 落地实战：业界模式 + 可抄样例
+
+> 定位一句话：**Marker 是"给日志事件贴业务标签"**——SLF4J API 层的通用机制，跨引擎可用，不启用时零成本；**TurboFilter 是"事件构造前的全局拦截器"**——Logback 专属（log4j2 有近似物），每条日志都会经过它。两者组合的业界价值只有一句话：**不改业务代码、只动配置，就能改变日志的"归属"与"生死"**。本节每个模式都给代码、配置、业务流程和落地步骤，照抄即可跑通。
+
+### 7.6.1 先把 API 面吃透（10 分钟）
+
+- **创建**：`MarkerFactory.getMarker("AUDIT")`——工厂内部有缓存，重复调用返回同一实例；业界规范是**集中定义常量**（接口或枚举），全仓库 Marker 只在一处出现。log4j2 用 `MarkerManager.getMarker("AUDIT")`，姿势相同。
+- **多个标签**：一次调用可以带多个 Marker（`log.info(m1, "...")` 只能带一个，Fluent API 的 `.addMarker()` 可带多个）；事件上最终是列表（`OnMarkerEvaluator` 遍历 `event.getMarkerList()`）。
+- **Marker 树（组合）**：`AUDIT.addChild(PAYMENT)`——`contains()` 是**传递性匹配**（父含子即真），这是"大类打标、子类细分"的基础。log4j2 对应 `Marker.setParents(...)`。
+- **落在事件上**：`log.info(AUDIT, "...")` 最终进 `buildLoggingEventAndAppend` 的 `le.addMarker(marker)`（3.4 节③，`Logger.java` 第 427-432 行），之后 TurboFilter、Appender 级 Filter、pattern 的 `%marker` 转换符都能消费它。异步 Appender 下 Marker 是随事件传递的引用，无需像 MDC 那样手工快照（3.7 节）。
+
+### 7.6.2 Marker 的四个业界模式
+
+#### 模式一：审计/安全日志分流（最经典，合规刚需）
+
+**业务流程**：登录、支付、改权限这类敏感操作，合规上要求单独留存（留存期长于业务日志、可对接 SIEM）。用 Marker 分流后，业务代码只多传一个参数，审计日志自动从业务日志里剥离：
+
+```
+用户登录/支付/改权限（敏感操作）
+   │  业务代码：log.info(AUDIT, "login success, user={}", userId)
+   ▼
+Logger（还是本类 logger，不换成"审计专用 logger"）
+   ├─ root → ASYNC_FILE appender：OnMarkerEvaluator → DENY   → app.log（业务日志，不含审计）
+   └─ root → AUDIT_FILE appender：OnMarkerEvaluator → ACCEPT → audit.log（只有审计）
+                                              │
+                                              ▼
+                              Filebeat/采集器单独接管 → SIEM 长期留存
+```
+
+**代码**（业务侧零侵入）：
+
+```java
+// ① 集中定义：全仓库 Marker 只在此处出现
+public interface AuditMarkers {
+    Marker AUDIT = MarkerFactory.getMarker("AUDIT");
+}
+
+public class UserService {
+    private static final Logger log = LoggerFactory.getLogger(UserService.class);
+
+    public void login(String userId, String ip) {
+        boolean ok = doLogin(userId, ip);
+        // ② 同一条日志：带标走审计通道，不带标的普通日志不受任何影响
+        log.info(AuditMarkers.AUDIT, "login {}, userId={}, ip={}", ok ? "SUCCESS" : "FAILED", userId, ip);
+    }
+}
+```
+
+**配置**（logback.xml 关键段，在 7.5.3 样例的骨架上加两个 appender）：
+
+```xml
+<!-- 审计专属 appender：只收带 AUDIT 标的事件 -->
+<appender name="AUDIT_FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+    <file>${LOG_HOME}/audit.log</file>
+    <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
+        <fileNamePattern>${LOG_HOME}/audit.%d{yyyy-MM-dd}.log.gz</fileNamePattern>
+        <maxHistory>365</maxHistory>   <!-- 审计留存期独立于业务日志 -->
+    </rollingPolicy>
+    <encoder><pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger - %msg%n</pattern></encoder>
+    <filter class="ch.qos.logback.core.filter.EvaluatorFilter">
+        <evaluator class="ch.qos.logback.classic.boolex.OnMarkerEvaluator">
+            <marker>AUDIT</marker>
+        </evaluator>
+        <onMatch>ACCEPT</onMatch>
+        <onMismatch>DENY</onMismatch>
+    </filter>
+</appender>
+
+<!-- 业务主 appender：把带标的拒掉，防止审计日志双写 -->
+<filter class="ch.qos.logback.core.filter.EvaluatorFilter">
+    <evaluator class="ch.qos.logback.classic.boolex.OnMarkerEvaluator">
+        <marker>AUDIT</marker>
+    </evaluator>
+    <onMatch>DENY</onMatch>
+    <onMismatch>NEUTRAL</onMismatch>
+</filter>
+<!-- 挂进 7.5.3 样例 ⑪ 的 AsyncAppender 内，root 同时引用两个 appender -->
+```
+
+【源码证据】匹配语义在 `ch/qos/logback/classic/boolex/OnMarkerEvaluator.java`（第 31-58 行）：
+
+```java
+public class OnMarkerEvaluator extends EventEvaluatorBase<ILoggingEvent> {
+
+    List<String> markerList = new ArrayList<String>();
+
+    public void addMarker(String markerStr) {          // XML 的 <marker>xxx</marker> → addMarker
+        markerList.add(markerStr);
+    }
+
+    public boolean evaluate(ILoggingEvent event) throws NullPointerException, EvaluationException {
+
+        List<Marker> markerListInEvent = event.getMarkerList();   // 一个事件可以带多个 Marker
+        if (markerListInEvent == null || markerListInEvent.isEmpty()) {
+            return false;
+        }
+
+        for (String markerStr : markerList) {
+            for (Marker markerInEvent : markerListInEvent) {
+                if (markerInEvent.contains(markerStr)) {          // ★ contains：传递性匹配（父含子即真）
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+}
+```
+
+**contains 是传递性匹配**——这是模式二父子树能成立的原因。另外 `EvaluatorFilter` + `OnMarkerEvaluator` 这个组合**不需要 janino 依赖**（只有 `<if>` 条件和 `JaninoEventEvaluator` 需要）。
+
+**落地三步**：① 新建 Markers 常量类；② 敏感操作日志加 marker 参数；③ 配置里挂两个过滤 appender。**验证**：登录一次，audit.log 有记录、app.log 无该条。
+
+#### 模式二：Marker 组合树——大类打标、子类细分
+
+```java
+Marker AUDIT = MarkerFactory.getMarker("AUDIT");
+Marker AUDIT_PAYMENT = MarkerFactory.getMarker("AUDIT_PAYMENT");
+AUDIT.addChild(AUDIT_PAYMENT);                    // 父子组合
+
+log.info(AUDIT_PAYMENT, "refund {} ok", orderId); // 打子标
+```
+
+- 审计 appender 的过滤器**只配 `AUDIT` 一条**：`contains()` 传递性命中 `AUDIT_PAYMENT`，支付审计自动并入审计通道；哪天要给支付单独建 appender，再加一条 `<marker>AUDIT_PAYMENT</marker>` 的过滤器即可，业务代码零改动。
+- 想把标签打进文本：pattern 里加 `%marker`，ELK/检索侧就能按 tag 聚合。
+- log4j2 等价：`Marker PAYMENT = MarkerManager.getMarker("AUDIT_PAYMENT").setParents(MarkerManager.getMarker("AUDIT"));`，`MarkerFilter` 对父名匹配同样生效。
+
+#### 模式三：结构化采集（ELK 场景）——logstash-logback-encoder
+
+ELK 技术栈下业界最流行的 Marker 实践是第三方库 `net.logstash.logback:logstash-logback-encoder`：**把 Marker 变成 JSON 字段**，日志即数据、检索不靠正则：
+
+```java
+import static net.logstash.logback.marker.Markers.append;
+
+log.info(append("orderId", orderId).and(append("amount", amount)), "order paid");
+```
+
+```xml
+<encoder class="net.logstash.logback.encoder.LogstashEncoder"/>  <!-- 整行输出 JSON -->
+```
+
+**业务流程**：应用按行输出 JSON（orderId/amount 成为独立字段）→ Filebeat/Vector 采集 → Elasticsearch 字段级索引 → Kibana 直接按字段检索、聚合、告警。`Markers.append()` 内部就是构造特殊 Marker（无需预注册、无需全局配置）；`Markers.appendFields()`、`StructuredArguments.kv(...)` 是同族 API。**注意**：只有配 `LogstashEncoder` 字段才会成为 JSON 字段，普通 pattern 下会丢失——混用场景让它们进不同的 appender。
+
+#### 模式四：功能级日志开关（发版后的"暗开关"）
+
+场景：灰度的新链路（如推荐算法）日志量未知，先用 `PERF`/`REC` 标打点，生产默认 DENY，排障时改配置放行。关键价值：**开关粒度是"功能"而不是"logger 名"**——一个功能的日志散落在几十个类里，Marker 是唯一能横切它们的机制；而开关的载体是 7.6.3 的 TurboFilter 或 appender 级 `MarkerFilter`（log4j2 写法见 7.6.3 模式四映射表）。配置改动可借 3.8 节的 scan 热更新（logback.xml 场景）或配置中心+动态 Filter（7.6.3 模式四的自定义实现）。
+
+### 7.6.3 TurboFilter：语义与四个业界模式
+
+先立规矩——**三个必须记住的契约**：
+
+1. **执行时机**：每条日志调用都先过 TurboFilter 链，发生在 `LoggingEvent` 对象构造**之前**（3.4 节①）——DENY 省掉的是"整个事件 + 参数格式化"，这是它与 Appender 级 Filter 的本质区别（后者事件已构造）。
+2. **三值语义**：`DENY`（立即丢弃，后续过滤器和级别判断都不走）、`ACCEPT`（跳过级别检查直通，慎用）、`NEUTRAL`（交棒下一个过滤器/走正常级别判断）。
+3. **热路径红线**：它跑在业务线程里、每条日志一次——**必须无锁或低竞争、绝不碰 I/O**；一切动态行为靠原子变量 + 配置中心。
+
+【源码证据】契约定义：`ch/qos/logback/classic/turbo/TurboFilter.java`（第 38-58、92-102 行）：
+
+```java
+public abstract class TurboFilter extends ContextAwareBase implements LifeCycle {   // 第 38 行
+
+    /** 第 57 行：普通调用链（log.info(...)）走的抽象方法 */
+    public abstract FilterReply decide(Marker marker, Logger logger, Level level, String format, Object[] params,
+            Throwable t);
+
+    /** 第 92 行：Fluent API（log.atLevel()...log()）走这个重载，默认转译后委托上面的方法 */
+    public FilterReply decide(Logger logger, org.slf4j.event.LoggingEvent slf4jEvent) {
+        List<Marker> markers = slf4jEvent.getMarkers();
+        Marker firstMarker = (markers != null && !markers.isEmpty()) ? markers.get(0) : null;
+
+        Level logbackLevel = Level.convertAnSLF4JLevel(slf4jEvent.getLevel());
+        String format = slf4jEvent.getMessage();
+        Object[] params = slf4jEvent.getArgumentArray();
+        Throwable t = slf4jEvent.getThrowable();
+
+        return decide(firstMarker, logger, logbackLevel, format, params, t);   // 第 101 行
+    }
+}
+```
+
+**注意 TurboFilter 在 classic 包**，因为消费的是 classic 的 Logger/Level。
+
+#### 模式一：健康检查流量静音（MDCFilter，零代码）
+
+**业务流程**：K8s/网关每 5 秒探活一次，心跳日志刷屏。约定探活入口统一注入 MDC，一条配置全静音：
+
+```java
+// 网关 Filter/拦截器里（MDC 规范见 7.4 节：有借有还）
+MDC.put("reqType", isHealthCheck ? "health" : "biz");
+try { chain.doFilter(req, res); } finally { MDC.remove("reqType"); }
+```
+
+```xml
+<turboFilter class="ch.qos.logback.classic.turbo.MDCFilter">
+    <MDCKey>reqType</MDCKey>
+    <MDCValue>health</MDCValue>
+    <OnMatch>DENY</OnMatch>
+    <!-- OnMismatch 不配 = NEUTRAL，其余日志完全不受影响 -->
+</turboFilter>
+```
+
+【源码证据】两段一起看（`MatchingFilter.java` 第 24-27 行 + `MDCFilter.java` 第 64-76 行）：
+
+```java
+// ch/qos/logback/classic/turbo/MatchingFilter.java —— 默认值就是"什么都不做"
+public abstract class MatchingFilter extends TurboFilter {
+
+    protected FilterReply onMatch = FilterReply.NEUTRAL;     // 第 26 行
+    protected FilterReply onMismatch = FilterReply.NEUTRAL;  // 第 27 行
+    ...
+}
+
+// ch/qos/logback/classic/turbo/MDCFilter.java
+@Override
+public FilterReply decide(Marker marker, Logger logger, Level level, String format, Object[] params, Throwable t) {
+
+    if (!isStarted()) {
+        return FilterReply.NEUTRAL;
+    }
+
+    String value = MDC.get(MDCKey);     // 第 71 行：读 MDC 与配置值比对
+    if (this.value.equals(value)) {
+        return onMatch;                  // 命中 → 返回 OnMatch（默认 NEUTRAL！）
+    }
+    return onMismatch;
+}
+```
+
+**忘配 `OnMatch=DENY` 它就什么也不做**——命中后返回的是默认 NEUTRAL，这是小白第一个坑。
+
+#### 模式二：故障风暴抑制（DuplicateMessageFilter）
+
+**场景**：下游宕机 → 几百个线程同一秒打出同一条异常文案 → 磁盘写爆、采集端压垮。
+
+```xml
+<turboFilter class="ch.qos.logback.classic.turbo.DuplicateMessageFilter">
+    <allowedRepetitions>5</allowedRepetitions>   <!-- 同一条消息第 6 次起 DENY -->
+    <cacheSize>100</cacheSize>                   <!-- 消息指纹缓存条数 -->
+</turboFilter>
+```
+
+【源码证据】`ch/qos/logback/classic/turbo/DuplicateMessageFilter.java`（第 59-67 行）：
+
+```java
+@Override
+public FilterReply decide(Marker marker, Logger logger, Level level, String format, Object[] params, Throwable t) {
+    int count = msgCache.getMessageCountAndThenIncrement(format);   // ★ 指纹=format，params 被忽略
+    if (count <= allowedRepetitions) {
+        return FilterReply.NEUTRAL;
+    } else {
+        return FilterReply.DENY;
+    }
+}
+```
+
+**指纹是 format 字符串、参数被忽略**——"order {} paid" 无论多少单都算同一条，这正是抑制风暴的关键（也意味着它**不能**用于"不同参数都是有效信息"的场景，否则丢业务日志）。缓存 `msgCache` 在 `start()` 里按 `cacheSize` 构建为 `LRUMessageCache`（第 46-50 行），`stop()` 时清空。
+
+**业界权衡**：它有状态（消息计数表）且全局同步——只适合"防雪崩"兜底，不适合常开在全部热路径；`allowedRepetitions=0` 等于任何消息第二次即拒。
+
+#### 模式三：按租户/用户动态调级（DynamicThresholdFilter）——客服排障利器
+
+**业务流程**：客服接到投诉 → 在后台把该用户会话打上 `vipLevel=elevated` 标记（通常由网关按用户白名单注入 MDC）→ **该用户请求的全链路瞬间放开 DEBUG/TRACE，其他用户不受影响**。
+
+```xml
+<!-- 前提：logger/root 的级别先"全开"（如 root=TRACE），把放行权交给本过滤器 -->
+<turboFilter class="ch.qos.logback.classic.turbo.DynamicThresholdFilter">
+    <Key>vipLevel</Key>                                <!-- 看 MDC 里这个键 -->
+    <DefaultThreshold>INFO</DefaultThreshold>          <!-- 普通用户：INFO 及以上才放行 -->
+    <MDCValueLevelPair user="elevated" level="TRACE"/>      <!-- 排障用户：TRACE 也放行 -->
+</turboFilter>
+```
+
+【源码证据 1·三个 XML 标签的注册方法】`DynamicThresholdFilter extends TurboFilter`（第 130 行）；元素名对应 adder/setter（第 150、163、198 行）——**注意是 `<MDCValueLevelPair>`**（adder 方法 `addMDCValueLevelPair`）：
+
+```java
+// ch/qos/logback/classic/turbo/DynamicThresholdFilter.java（节选）
+public void setKey(String key) {                                   // 第 150 行 → <Key>
+    this.key = key;
+}
+
+public void setDefaultThreshold(Level defaultThreshold) {          // 第 163 行 → <DefaultThreshold>
+    this.defaultThreshold = defaultThreshold;
+}
+
+/** 第 198 行 → <MDCValueLevelPair user="..." level="..."/>（按 value 去重入表） */
+public void addMDCValueLevelPair(MDCValueLevelPair mdcValueLevelPair) {
+    if (valueLevelMap.containsKey(mdcValueLevelPair.getValue())) {
+        addError(mdcValueLevelPair.getValue() + " has been already set");
+    } else {
+        valueLevelMap.put(mdcValueLevelPair.getValue(), mdcValueLevelPair.getLevel());
+    }
+}
+```
+
+【源码证据 2·判定方向】javadoc 原文（第 39-49 行）说得最清楚：
+
+```java
+ * If 'levelAssociatedWithMDCValue' is higher or equal to the level of the
+ * current logger request, the decide() method returns the value of
+ * getOnHigherOrEqual(), if it is lower than the value of getOnLower() is
+ * returned. Both 'onHigherOrEqual' and 'onLower' can be set by the user. By
+ * default, 'onHigherOrEqual' is set to NEUTRAL and 'onLower' is set to DENY.
+```
+
+字段默认值实测（第 135-136 行）：`onHigherOrEqual = FilterReply.NEUTRAL; onLower = FilterReply.DENY;`。`decide()` 主体（第 238-255 行）：
+
+```java
+@Override
+public FilterReply decide(Marker marker, Logger logger, Level level, String s, Object[] objects,
+        Throwable throwable) {
+
+    String mdcValue = MDC.get(this.key);
+    if (!isStarted()) {
+        return FilterReply.NEUTRAL;
+    }
+
+    Level levelAssociatedWithMDCValue = null;
+    if (mdcValue != null) {
+        levelAssociatedWithMDCValue = valueLevelMap.get(mdcValue);
+    }
+    if (levelAssociatedWithMDCValue == null) {
+        levelAssociatedWithMDCValue = defaultThreshold;       // 没标记 → 用 DefaultThreshold
+    }
+    if (level.isGreaterOrEqual(levelAssociatedWithMDCValue)) { // 事件 ≥ 阈值（更严重或相等）
+        return onHigherOrEqual;                                // 默认 NEUTRAL → 交棒正常级别判断
+    } else {                                                   // 事件 < 阈值（更啰嗦）
+        return onLower;                                        // 默认 DENY
+    }
+}
+```
+
+**为什么 root 要先全开**：NEUTRAL 之后还会走正常级别判断（root=INFO 时 DEBUG 依然被挡）。自洽的组合是 **root/logger 级别开到最低 + DTF 把门**：普通用户 DEBUG/TRACE 直接 DENY（省事件构造，比"靠级别判断丢弃"还省），被标记用户全放。想跳过后续判断，代码里调 `setOnHigherOrEqual(FilterReply.ACCEPT)`（第 177-179 行，取值是 `FilterReply` 枚举）。这是小白最容易配反的地方：**只配 DTF、root 仍是 INFO，标记用户什么都多不出来**。
+
+#### 模式四：自定义业务规则 TurboFilter（完整可抄）
+
+**场景（业界常见）**：大促期间按配置中心开关静默某类埋点日志；或按业务规则（时间窗、灰度名单）动态控制。
+
+```java
+package com.example.logging;
+
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.turbo.TurboFilter;   // ★ classic 包，别 import 错
+import org.slf4j.Marker;
+import org.slf4j.MarkerFactory;
+
+import java.util.concurrent.atomic.AtomicBoolean;
+
+/**
+ * <turboFilter class="com.example.logging.SilenceMarkerTurboFilter">
+ *     <markerName>PERF</markerName>
+ * </turboFilter>
+ * 运行期把 silenced 切到 true 即全局静默 PERF 标日志（无锁读）。
+ */
+public class SilenceMarkerTurboFilter extends TurboFilter {
+
+    private String markerName;
+    private Marker marker;                                  // start() 预解析，decide() 零构造
+    private final AtomicBoolean silenced = new AtomicBoolean(false);
+
+    public void setMarkerName(String markerName) {          // Joran 按 setter 名注入 <markerName>
+        this.markerName = markerName;
+    }
+
+    /** 配置中心监听器回调入口 */
+    public void setSilenced(boolean value) {
+        silenced.set(value);
+    }
+
+    @Override
+    public void start() {                                   // LifeCycle：启动期做校验与预处理
+        if (markerName == null || markerName.isEmpty()) {
+            addError("\"<markerName>\" parameter is mandatory. Filter won't start.");
+            return;                                         // 不 start = 完全不生效（Status 可见）
+        }
+        this.marker = MarkerFactory.getMarker(markerName);
+        super.start();
+    }
+
+    @Override
+    public FilterReply decide(Marker marker, Logger logger, Level level,
+                              String format, Object[] params, Throwable t) {
+        if (!isStarted() || !silenced.get() || marker == null) {
+            return FilterReply.NEUTRAL;                     // ★ 契约：一切"不归我管"都返回 NEUTRAL
+        }
+        return marker.contains(this.marker) ? FilterReply.DENY : FilterReply.NEUTRAL;
+    }
+}
+```
+
+**配置**：
+
+```xml
+<turboFilter class="com.example.logging.SilenceMarkerTurboFilter">
+    <markerName>PERF</markerName>
+</turboFilter>
+```
+
+**落地四步**：① 继承 `ch.qos.logback.classic.turbo.TurboFilter`；② XML 用 `<turboFilter class="全类名">` + 属性子标签（Joran 按 setter 名注入：`<markerName>` → `setMarkerName`）；③ `start()` 里做参数校验，失败 `addError(...)` 且不调 `super.start()`（问题会进 Status，3.2 节 ⑥ 的 statusListener 能看到）；④ `decide()` 全路径默认 NEUTRAL。**验证**：先单测（new LoggerContext 手动挂 filter），再联调看 DENY 生效；需要运行期动态挂载可用 `loggerContext.addTurboFilter(...)`。
+
+#### log4j2 侧的对应物（映射表）
+
+| logback TurboFilter | log4j2 近似物 | 时机与差异 |
+|---|---|---|
+| `MDCFilter` | `<ThreadContextMapFilter>`（可挂全局/LoggerConfig/Appender 三层） | log4j2 的全局 Filter 同样在 isEnabled 阶段（事件构造前，4.5 节① `PrivateConfig.filter`）执行 |
+| `DynamicThresholdFilter` | log4j2 同名 `DynamicThresholdFilter`（`<Key>`/`<DefaultThreshold>`/KeyValuePair 族） | 语义相近 |
+| `DuplicateMessageFilter` | `BurstFilter`（`level` + `rate` 条/秒 + `maxBurst` 突发容量；`BurstFilter.java:58-60` 默认 10 条/秒、突发 1000） | 语义差异：按"重复"抑制 vs 按"速率"限流——风暴场景 rate 更平滑 |
+| 自定义 `TurboFilter` | 实现 `org.apache.logging.log4j.core.Filter` + `@Plugin` 注解（4.7 节插件体系），编译期自动进索引 | log4j2 Filter 可挂 Configuration/LoggerConfig/Appender 三层；TurboFilter 只有全局一层 |
+
+【源码证据】`BurstFilter` 的默认参数（`log4j-core/.../core/filter/BurstFilter.java` 第 54-60 行）：
+
+```java
+public final class BurstFilter extends AbstractFilter {
+
+    private static final long NANOS_IN_SECONDS = 1000000000;
+
+    private static final int DEFAULT_RATE = 10;             // 默认 10 条/秒
+
+    private static final int DEFAULT_RATE_MULTIPLE = 100;   // 突发容量倍数 → maxBurst 未配置时 = rate × 100 = 1000
+```
+
+### 7.6.4 小白落地清单（照做不踩坑）
+
+1. Marker 常量集中一个接口/枚举，命名大写 + 领域前缀（`AUDIT_*`、`PERF_*`）；热路径绝不 new/拼接 Marker 字符串（工厂有缓存，但常量化便于全局检索）。
+2. 审计分流 = 模式一的双过滤器（AUDIT appender ACCEPT + 业务 appender DENY），防止审计日志双写。
+3. Marker 父子树表达"大类 ⊃ 子类"；`contains()` 是传递匹配，过滤器只配大类。
+4. ELK 场景优先 `logstash-logback-encoder` 的 `Markers.append()`；它只在配 `LogstashEncoder` 的 appender 上生效。
+5. `EvaluatorFilter + OnMarkerEvaluator` 不需要 janino；`<if>` 与 `JaninoEventEvaluator` 才需要。
+6. TurboFilter 一切"不归我管"的分支返回 **NEUTRAL**；`MatchingFilter` 族忘配 `OnMatch` 等于没配（默认 NEUTRAL）。
+7. TurboFilter 里绝不 I/O、绝不引入锁竞争热点；动态开关用 `AtomicBoolean` + 配置中心。
+8. 自定义 filter 的 `start()` 里校验参数，失败 `addError(...)` 且不启动（不启动 = 不生效）。
+9. DynamicThresholdFilter 的正确姿势：**root/logger 级别先全开 + DTF 把门**；只配 DTF 不动级别，标记用户什么也多不出来。
+10. 验证顺序：单测挂 filter → 联调看文件归属 → 配 `<statusListener>`（7.5.3 节⑥）确认 filter 被 start。
+
+## 7.7 本章小结
 
 - 依赖三选一：slf4j+logback（默认）、slf4j+log4j-slf4j2-impl、log4j-api+core；Boot 场景配 starter 排除法。
 - 配置文件五要素：Properties（变量）、Appenders（Console/RollingFile/Async）、Loggers（包级覆盖）、Root（兜底）、热更新开关（scan / monitorInterval）。
 - Logback 必调参数：queueSize（默认 256 太小）；Log4j2 必调：全异步开关 + RingBufferSize + includeLocation 关闭。
 - 代码六条：门面唯一、参数化、异常收尾、MDC 借还、级别语义、Marker 分流。
 - 配置文件全解（7.5 节）：**门面没有配置文件**，配置属于绑定/引擎；logback 与 logback-spring 双样例逐节点对照（后者=前者 + springProfile/springProperty + Boot 注入变量，禁 scan）、log4j2 Lookup 管道（jndi 默认禁用）、simple 的 11 键、JUL 双闸、Log4j1 语法，以及"桥接后旧配置文件失效"陷阱。
+- Marker/TurboFilter 实战（7.6 节）：Marker 四模式（审计分流双过滤器、父子树传递匹配、logstash-logback-encoder 结构化、功能级暗开关）+ TurboFilter 四模式（MDCFilter 静音、DuplicateMessageFilter 防风暴且指纹是 format、DynamicThresholdFilter 需 root 全开 + 把门、自定义 filter 的 NEUTRAL 保命契约）+ log4j2 映射表与十条落地清单。
 
 ---
 
@@ -1965,6 +2399,10 @@ JVM 启动，第一个用到 Logger 的类触发类加载
 | RingBufferLogEvent | log4j-core | 可复用事件：setValues 重填 + swapParameters 参数复用（GC-free） |
 | DefaultConfiguration | log4j-core | 兜底配置：root=ERROR + Console |
 | SLF4JBridgeHandler | jul-to-slf4j | JUL→SLF4J 桥：install/removeHandlersForRootLogger/publish |
+| TurboFilter（+MatchingFilter） | logback-classic | 事件构造前全局拦截：decide 三值（DENY/ACCEPT/NEUTRAL）；MatchingFilter 默认 onMatch/onMismatch=NEUTRAL |
+| MDCFilter / DynamicThresholdFilter / DuplicateMessageFilter | logback-classic.turbo | 三个内置 TurboFilter：MDC 静音 / 按租户动态阈值（onLower 默认 DENY）/ 重复消息抑制（指纹=format） |
+| OnMarkerEvaluator | logback-classic.boolex | 按 Marker 过滤事件（contains 传递匹配），配 EvaluatorFilter 做审计分流 |
+| MarkerFilter / BurstFilter | log4j2-core | log4j2 侧对应物：Marker 过滤 / 速率限流（rate 条/秒 + maxBurst 突发） |
 | LogFactory（jcl-over-slf4j） | jcl-over-slf4j | JCL 类替身：同包名 LogFactory 转发 SLF4J |
 | LoggingSystem / LogbackLoggingSystem | spring-boot | Boot 日志统一入口：探测实现 + 配置文件接管 |
 | SpringBootJoranConfigurator | spring-boot | Boot 扩展的 Joran 解析器：注册 springProfile/springProperty 两个标签规则 |
@@ -2024,5 +2462,8 @@ JVM 启动，第一个用到 Logger 的类触发类加载
 | `no applicable action for [springProfile]/[springProperty]` | 扩展标签写进了 `logback.xml`（被 Logback 裸解析）或开了 `scan` | 改用 `logback-spring.xml`；scan 与 Boot 扩展二选一（3.9.5 节） |
 | logback-spring.xml 好像没生效 | 同目录存在 `logback.xml`（标准名优先）或 `logging.config` 指向了别的文件 | 删掉/改名 `logback.xml`；启动日志确认加载路径（3.9.2 节） |
 | `%clr`/`%wEx` 报未知转换符 | Boot 内置转换器只注册在"无配置文件"默认路径 | 自定义文件里自己 `<conversionRule>` 声明（3.9.5 节） |
+| 配了 MDCFilter/MarkerFilter 但没效果 | MatchingFilter 族 onMatch 默认 NEUTRAL，忘配 `OnMatch=DENY/ACCEPT` 等于没配 | 补 onMatch/onMismatch（7.6.3 节模式一） |
+| DynamicThresholdFilter 放行了标记用户但 DEBUG 还是看不到 | root/logger 级别没全开，NEUTRAL 后被正常级别判断挡住 | root 全开 + DTF 把门（7.6.3 节模式三） |
+| 上线自定义 TurboFilter 后日志全没了 | decide() 某分支忘返 NEUTRAL，或 filter 未 start | 全路径默认 NEUTRAL + start() 校验（7.6.3 节模式四） |
 | StackOverflowError 与日志有关 | 桥接包循环转发（6.4） | 依赖树排环，删一个方向的桥 |
 | 启动报 No Log4j 2 configuration file found | 配置文件未命名/未进 resources | 按 4.6 的文件名清单核对 |
