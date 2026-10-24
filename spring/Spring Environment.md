@@ -217,7 +217,27 @@ protected <T> @Nullable T getProperty(String key, Class<T> targetValueType, bool
 2. 值为 `null` 时循环继续。Boot 文档 `external-config.adoc` 第 106–107 行把这一点说死了：JSON 里的 `null` 盖不住更低优先级的值。源码上的原因就是第 81 行。
 3. 命中的字符串会立刻做 `${...}` 嵌套展开，展开时再次调用 `getProperty`，所以占位符引用的是**整条列表上的获胜值**，不是"写这个占位符的那个文件里的值"。
 
-`CompositePropertySource` 内部同样是按加入顺序短路（`CompositePropertySource.java` 第 63–70 行）。`@PropertySource` 把同名源收成 composite 时，后处理的那个用 `addFirstPropertySource` 放到 composite 头部（第 115–119 行），所以**后解析到的同名 `@PropertySource` 更高**。
+`CompositePropertySource` 内部同样是按加入顺序短路。`@PropertySource` 把同名源收成 composite 时，后处理的那个用 `addFirstPropertySource` 放到 composite 头部，所以后解析到的同名 `@PropertySource` 更高。
+
+```java
+// CompositePropertySource.java
+public @Nullable Object getProperty(String name) {
+    for (PropertySource<?> propertySource : this.propertySources) {
+        Object candidate = propertySource.getProperty(name);
+        if (candidate != null) {
+            return candidate;
+        }
+    }
+    return null;
+}
+
+public void addFirstPropertySource(PropertySource<?> propertySource) {
+    List<PropertySource<?>> existing = new ArrayList<>(this.propertySources);
+    this.propertySources.clear();
+    this.propertySources.add(propertySource);
+    this.propertySources.addAll(existing);
+}
+```
 
 ## 2.5 标准环境与 Servlet 环境自带的顺序
 
@@ -253,7 +273,48 @@ protected void customizePropertySources(MutablePropertySources propertySources) 
 
 Shell 不允许变量名里出现 `.`。Framework 在**读取环境变量这一份 PropertySource 时**做了等价名尝试。
 
-【源码证据】`fw:spring-core/.../env/SystemEnvironmentPropertySource.java` 第 33–41 行注释，`getProperty` 第 93–99 行，`checkPropertyName` 第 123–145 行。
+【源码证据】`fw:spring-core/.../env/SystemEnvironmentPropertySource.java`
+
+```java
+public @Nullable Object getProperty(String name) {
+    String actualName = resolvePropertyName(name);
+    return super.getProperty(actualName);
+}
+
+protected final String resolvePropertyName(String name) {
+    String resolvedName = checkPropertyName(name);
+    if (resolvedName != null) {
+        return resolvedName;
+    }
+    String uppercasedName = name.toUpperCase(Locale.ROOT);
+    if (!name.equals(uppercasedName)) {
+        resolvedName = checkPropertyName(uppercasedName);
+        if (resolvedName != null) {
+            return resolvedName;
+        }
+    }
+    return name;
+}
+
+private @Nullable String checkPropertyName(String name) {
+    if (this.source.containsKey(name)) {
+        return name;
+    }
+    String noDotName = name.replace('.', '_');
+    if (!name.equals(noDotName) && this.source.containsKey(noDotName)) {
+        return noDotName;
+    }
+    String noHyphenName = name.replace('-', '_');
+    if (!name.equals(noHyphenName) && this.source.containsKey(noHyphenName)) {
+        return noHyphenName;
+    }
+    String noDotNoHyphenName = noDotName.replace('-', '_');
+    if (!noDotName.equals(noDotNoHyphenName) && this.source.containsKey(noDotNoHyphenName)) {
+        return noDotNoHyphenName;
+    }
+    return null;
+}
+```
 
 `getProperty("foo.bar")` 会依次试：
 
@@ -261,7 +322,7 @@ Shell 不允许变量名里出现 `.`。Framework 在**读取环境变量这一�
 - `foo_bar`（点换成下划线）
 - `foo-bar` 的连字符换成下划线
 - 点、连字符都换成下划线
-- 以及上述形式的全大写（`resolvePropertyName` 第 113–118 行先转大写再走一遍）
+- 以及上述形式的全大写（`resolvePropertyName` 先 `toUpperCase` 再走一遍 `checkPropertyName`，见上面的代码）
 
 所以 `SPRING_PROFILES_ACTIVE=prod` 能被读成 `spring.profiles.active`。常量注释写在 `AbstractEnvironment.java` 第 71–74 行。
 
@@ -269,9 +330,22 @@ Shell 不允许变量名里出现 `.`。Framework 在**读取环境变量这一�
 
 ## 2.7 命令行只认 `--key=value`
 
-【源码证据】`fw:spring-core/.../env/CommandLinePropertySource.java` 第 209 行：名字常量 `commandLineArgs`。`SimpleCommandLinePropertySource.java` 第 38–40 行：选项参数的语法是 `--optName[=optValue]`。
+【源码证据】`fw:spring-core/.../env/CommandLinePropertySource.java`、`SimpleCommandLinePropertySource.java`
 
-不以 `--` 开头的参数收进 `nonOptionArgs`（第 212 行），**不会**变成普通配置 key。`-Dkey=value` 是 JVM 系统属性，走 `systemProperties`，比 `--key=value` 低一档。
+```java
+/** The default name given to CommandLinePropertySource instances: {@value}. */
+public static final String COMMAND_LINE_PROPERTY_SOURCE_NAME = "commandLineArgs";
+
+/** The default name of the property representing non-option arguments: {@value}. */
+public static final String DEFAULT_NON_OPTION_ARGS_PROPERTY_NAME = "nonOptionArgs";
+```
+
+```java
+ * Option arguments must adhere to the exact syntax:
+ * <pre class="code">--optName[=optValue]</pre>
+```
+
+不以 `--` 开头的参数收进 `nonOptionArgs`，不会变成普通配置 key。`-Dkey=value` 是 JVM 系统属性，走 `systemProperties`，比 `--key=value` 低一档。
 
 Boot 把这份源放到列表头：
 
@@ -305,11 +379,41 @@ app:
 
 【源码证据】`fw:spring-core/.../env/AbstractEnvironment.java`
 
-- 激活属性名 `spring.profiles.active`（第 77 行），逗号分隔。
-- `doGetActiveProfiles`（第 272–282 行）：若还没人调用过 `setActiveProfiles`，就读这个属性并写进集合。
-- `isProfileActive`（第 407–411 行）：在激活集合里，或者激活集合为空且该 profile 属于默认集合（默认含 `default`）。
+```java
+protected Set<String> doGetActiveProfiles() {
+    synchronized (this.activeProfiles) {
+        if (this.activeProfiles.isEmpty()) {
+            String profiles = doGetActiveProfilesProperty();
+            if (StringUtils.hasText(profiles)) {
+                setActiveProfiles(StringUtils.commaDelimitedListToStringArray(
+                        StringUtils.trimAllWhitespace(profiles)));
+            }
+        }
+        return this.activeProfiles;
+    }
+}
 
-Boot 在 ConfigData 收尾时用算出来的 profile **覆盖** Environment 上的激活集合（`ConfigDataEnvironment.applyToEnvironment` 第 337–339 行 `setActiveProfiles`）。所以"profile 文件为什么被加载"要看下一章的贡献树，而不是看这份集合的初始值。`@Profile` 判断的是最终这组激活 profile。
+protected boolean isProfileActive(String profile) {
+    validateProfile(profile);
+    Set<String> currentActiveProfiles = doGetActiveProfiles();
+    return (currentActiveProfiles.contains(profile) ||
+            (currentActiveProfiles.isEmpty() && doGetDefaultProfiles().contains(profile)));
+}
+```
+
+- 激活属性名 `spring.profiles.active`，逗号分隔。
+- `doGetActiveProfiles`：若还没人调用过 `setActiveProfiles`，就读这个属性并写进集合。
+- `isProfileActive`：在激活集合里，或者激活集合为空且该 profile 属于默认集合（默认含 `default`）。
+
+Boot 在 ConfigData 收尾时用算出来的 profile 覆盖 Environment 上的激活集合：
+
+```java
+// ConfigDataEnvironment.java  applyToEnvironment
+this.environment.setDefaultProfiles(StringUtils.toStringArray(profiles.getDefault()));
+this.environment.setActiveProfiles(StringUtils.toStringArray(profiles.getActive()));
+```
+
+所以"profile 文件为什么被加载"要看下一章的贡献树，而不是看这份集合的初始值。`@Profile` 判断的是最终这组激活 profile。
 
 **本章小结**：Framework 规定了货架和"非 null 短路"。标准货架出厂时只有系统属性和环境变量，系统属性在前。Servlet 三个源更靠前。命令行、配置文件、Nacos 都还没出现。`null` 不会挡住更低的来源。环境变量的 `FOO_BAR` 只在读 OS 环境时等价于 `foo.bar`。
 
@@ -332,7 +436,16 @@ DefaultPropertiesPropertySource.moveToEnd(environment);                   // 默
 
 `environmentPrepared` 发布 `ApplicationEnvironmentPreparedEvent`，`EnvironmentPostProcessorApplicationListener`（登记在 `spring.factories` 第 45 行）跑完全部 `EnvironmentPostProcessor`。配置文件进 Environment 发生在这里，**早于** `refreshContext`（`run` 方法第 309 行）。这是 `logging.level.*` 能在日志系统初始化时就生效的原因。
 
-`defaultProperties` 的收尾在 `DefaultPropertiesPropertySource.moveToEnd`（`boot:.../env/DefaultPropertiesPropertySource.java` 第 115–119 行）：从列表里摘下再 `addLast`。无论中间谁 `addLast` 过配置文件，默认值都垫底。
+`defaultProperties` 的收尾在 `DefaultPropertiesPropertySource.moveToEnd`：从列表里摘下再 `addLast`。无论中间谁 `addLast` 过配置文件，默认值都垫底。
+
+```java
+public static void moveToEnd(MutablePropertySources propertySources) {
+    PropertySource<?> propertySource = propertySources.remove(NAME);
+    if (propertySource != null) {
+        propertySources.addLast(propertySource);
+    }
+}
+```
 
 ## 3.2 高优先级几档是怎么锚上去的
 
@@ -351,10 +464,25 @@ org.springframework.boot.EnvironmentPostProcessor=
 
 | 处理器 | 证据 | 插入方式 |
 |---|---|---|
-| Random | `RandomValuePropertySource.addToEnvironment` 第 158–162 行 | 有 `systemEnvironment` 就 `addAfter` 它，否则 `addLast`。只回答 `random.*` |
-| JSON | `SpringApplicationJsonEnvironmentPostProcessor` 第 71 行 ORDER，第 143–165 行 | 有 Servlet 源就插到第一个 Servlet 源之前；否则 `addBefore(systemProperties)`。没有这些锚点才 `addFirst` |
-| systemEnvironment 包装 | `SystemEnvironmentPropertySourceEnvironmentPostProcessor` 第 24–28、48–50 行 | **替换**同名源，给每个环境变量补上 Origin，不改变位置 |
-| ConfigData | `ConfigDataEnvironmentPostProcessor` 第 40 行 `ORDER = HIGHEST_PRECEDENCE + 10` | 见 3.3，全部 `addLast` |
+| Random | `RandomValuePropertySource.addToEnvironment` | 有 `systemEnvironment` 就 `addAfter` 它，否则 `addLast`。只回答 `random.*` |
+| JSON | `SpringApplicationJsonEnvironmentPostProcessor` | 有 Servlet 源就插到第一个 Servlet 源之前；否则 `addBefore(systemProperties)`。没有这些锚点才 `addFirst` |
+| systemEnvironment 包装 | `SystemEnvironmentPropertySourceEnvironmentPostProcessor` | 替换同名源，给每个环境变量补上 Origin，不改变位置 |
+| ConfigData | `ConfigDataEnvironmentPostProcessor`，`ORDER = HIGHEST_PRECEDENCE + 10` | 见 3.3，全部 `addLast` |
+
+随机源的插入：
+
+```java
+public static void addToEnvironment(ConfigurableEnvironment environment, Log logger) {
+    MutablePropertySources sources = environment.getPropertySources();
+    RandomValuePropertySource randomSource = new RandomValuePropertySource(RANDOM_PROPERTY_SOURCE_NAME);
+    if (sources.get(StandardEnvironment.SYSTEM_ENVIRONMENT_PROPERTY_SOURCE_NAME) != null) {
+        sources.addAfter(StandardEnvironment.SYSTEM_ENVIRONMENT_PROPERTY_SOURCE_NAME, randomSource);
+    }
+    else {
+        sources.addLast(randomSource);
+    }
+}
+```
 
 JSON 插在系统属性之前、命令行之后（命令行已经在下标 0，`addBefore(systemProperties)` 不会把它挤下去）。随机源紧挨在环境变量后面，因此随机源低于环境变量、高于随后 `addLast` 的配置文件。和 1.5 的表一致。
 
@@ -408,19 +536,63 @@ for (ConfigDataEnvironmentContributor contributor : contributors) {
 
 已有的命令行、系统属性、环境变量是 `Kind.EXISTING`，这里不会再动它们。配置文件因此整体低于第 3–10 档。随后第 333 行再次 `moveToEnd(defaultProperties)`。
 
-遍历顺序决定"哪份文件先被 addLast"（先 addLast = 更高）。【源码证据】`ConfigDataEnvironmentContributor.java` 内部迭代器第 545–586 行：
+遍历顺序决定哪份文件先被 `addLast`（先 addLast = 更高）。【源码证据】`ConfigDataEnvironmentContributor.java` 内部迭代器：先走 profile 阶段的子节点，再走普通阶段的子节点，最后才是节点自己。
 
-- 先走 `AFTER_PROFILE_ACTIVATION` 的子节点（profile 文件、以及被标成 profile 级的 import）
-- 再走 `BEFORE_PROFILE_ACTIVATION` 的子节点（普通 `application.*` 和普通 import）
-- **最后才是节点自己**
+```java
+private ContributorIterator() {
+    this.phase = ImportPhase.AFTER_PROFILE_ACTIVATION;
+    this.children = getChildren(this.phase).iterator();
+    this.current = Collections.emptyIterator();
+}
 
-子节点先于父节点被 `addLast`，所以 **import 进来的文档高于写下 `spring.config.import` 的那份文档**。profile 阶段先于普通阶段被 `addLast`，所以 **profile 文件高于非 profile 文件**。这和文档第 280、294、235 行的文字是同一件事。
+private @Nullable ConfigDataEnvironmentContributor fetchIfNecessary() {
+    if (this.next != null) {
+        return this.next;
+    }
+    if (this.current.hasNext()) {
+        this.next = this.current.next();
+        return this.next;
+    }
+    if (this.children.hasNext()) {
+        this.current = this.children.next().iterator();
+        return fetchIfNecessary();
+    }
+    if (this.phase == ImportPhase.AFTER_PROFILE_ACTIVATION) {
+        this.phase = ImportPhase.BEFORE_PROFILE_ACTIVATION;
+        this.children = getChildren(this.phase).iterator();
+        return fetchIfNecessary();
+    }
+    if (this.phase == ImportPhase.BEFORE_PROFILE_ACTIVATION) {
+        this.phase = null;
+        this.next = ConfigDataEnvironmentContributor.this;
+        return this.next;
+    }
+    return null;
+}
+```
+
+子节点先于父节点被 `addLast`，所以 import 进来的文档高于写下 `spring.config.import` 的那份文档。profile 阶段先于普通阶段被 `addLast`，所以 profile 文件高于非 profile 文件。
 
 ## 3.4 贡献树里还有两次"倒序"，它们专门用来实现"后者优先"
 
 **同一批候选资源，从最后一个开始放入 LinkedHashMap。**
 
-【源码证据】`ConfigDataImporter.java` `load` 第 106–126 行：`for (int i = candidates.size() - 1; i >= 0; i--)` 然后 `result.put`。`LinkedHashMap` 的迭代顺序就是放入顺序。于是解析列表里的最后一项，会变成贡献者列表里的第一项，最先被 `addLast`，优先级最高。
+【源码证据】`ConfigDataImporter.java` `load`：候选从最后一个开始放入 `LinkedHashMap`。放入顺序就是后来的遍历顺序。解析列表里的最后一项最先被 `addLast`，优先级最高。
+
+```java
+private Map<ConfigDataResolutionResult, ConfigData> load(..., List<ConfigDataResolutionResult> candidates) {
+    Map<ConfigDataResolutionResult, ConfigData> result = new LinkedHashMap<>();
+    for (int i = candidates.size() - 1; i >= 0; i--) {
+        ConfigDataResolutionResult candidate = candidates.get(i);
+        ...
+        ConfigData loaded = this.loaders.load(loaderContext, resource);
+        if (loaded != null) {
+            result.put(candidate, loaded);
+        }
+    }
+    return result;
+}
+```
 
 **同一份 ConfigData 里的多个 PropertySource（YAML 的 `---` 多文档），按下标从大到小挂成贡献者。**
 
@@ -460,9 +632,22 @@ for (int i = data.getPropertySources().size() - 1; i >= 0; i--) {
 
 ## 4.2 Profile：激活列表里最后一个最高
 
-【源码证据】`StandardConfigDataLocationResolver.getProfileSpecificReferences` 第 141–150 行：按 `profiles` 的迭代顺序，为每个 profile 生成 `application-{profile}` 引用。
+【源码证据】`StandardConfigDataLocationResolver.getProfileSpecificReferences`：按 `profiles` 的迭代顺序，为每个 profile 生成 `application-{profile}` 引用。
 
-加载时 `ConfigDataImporter.load` 再把候选倒序。激活列表 `[prod, live]` 里 `live` 排在后面，倒序之后最先 `addLast`，所以 **`application-live` 高于 `application-prod`**。文档第 236–237 行的原话是 last-wins。
+```java
+private Set<StandardConfigDataReference> getProfileSpecificReferences(...) {
+    Set<StandardConfigDataReference> references = new LinkedHashSet<>();
+    for (String profile : profiles) {
+        for (ConfigDataLocation configDataLocation : configDataLocations) {
+            String resourceLocation = getResourceLocation(context, configDataLocation);
+            references.addAll(getReferences(configDataLocation, resourceLocation, profile));
+        }
+    }
+    return references;
+}
+```
+
+加载时 `ConfigDataImporter.load` 再把候选倒序。激活列表 `[prod, live]` 里 `live` 排在后面，倒序之后最先 `addLast`，所以 `application-live` 高于 `application-prod`。
 
 profile 文件本身带着 `Option.PROFILE_SPECIFIC`：
 
@@ -475,7 +660,19 @@ private static final PropertySourceOptions PROFILE_SPECIFIC =
 PropertySourceOptions options = (resource.getProfile() != null) ? PROFILE_SPECIFIC : NON_PROFILE_SPECIFIC;
 ```
 
-`ConfigData.Option` 的定义（`ConfigData.java` 第 256–274 行）：
+`ConfigData.Option` 的定义：
+
+```java
+public enum Option {
+    IGNORE_IMPORTS,
+    IGNORE_PROFILES,
+    /**
+     * Indicates that the source is "profile specific" and should be included after
+     * profile specific sibling imports.
+     */
+    PROFILE_SPECIFIC
+}
+```
 
 | 选项 | 含义 |
 |---|---|
@@ -494,7 +691,23 @@ PropertiesPropertySourceLoader     扩展名 properties, xml
 YamlPropertySourceLoader           扩展名 yml, yaml
 ```
 
-【源码证据】`StandardConfigDataLocationResolver.getReferencesForConfigName` 第 188–199 行：每个扩展名 `references.addFirst`。加载器在前的扩展名会先被 addFirst，随后被更晚的扩展名顶到队尾。队尾在 `ConfigDataImporter.load` 的倒序里变成最先 `addLast`。
+【源码证据】`StandardConfigDataLocationResolver.getReferencesForConfigName`：每个扩展名 `references.addFirst`。加载器在前的扩展名会先被 addFirst，随后被更晚的扩展名顶到队尾。队尾在 `ConfigDataImporter.load` 的倒序里变成最先 `addLast`。
+
+```java
+private Deque<StandardConfigDataReference> getReferencesForConfigName(...) {
+    Deque<StandardConfigDataReference> references = new ArrayDeque<>();
+    for (PropertySourceLoader propertySourceLoader : this.propertySourceLoaders) {
+        for (String extension : propertySourceLoader.getFileExtensions()) {
+            StandardConfigDataReference reference = new StandardConfigDataReference(
+                    configDataLocation, directory, directory + name, profile, extension, propertySourceLoader, null);
+            if (!references.contains(reference)) {
+                references.addFirst(reference);
+            }
+        }
+    }
+    return references;
+}
+```
 
 推演结果（同一目录、同一 profile）：
 
@@ -555,7 +768,17 @@ classpath:/application.yaml
 
 ## 5.1 它在 refresh 里才进货架，所以垫底，而且赶不上早期配置
 
-【源码证据】`fw:spring-context/.../annotation/ConfigurationClassParser.java` `doProcessConfigurationClass` 第 314–319 行：处理配置类时，在 `@ComponentScan` 之前处理 `@PropertySource`。
+【源码证据】`fw:spring-context/.../annotation/ConfigurationClassParser.java` `doProcessConfigurationClass`：处理配置类时，在 `@ComponentScan` 之前处理 `@PropertySource`。
+
+```java
+for (AnnotationAttributes propertySource : AnnotationConfigUtils.attributesForRepeatable(
+        sourceClass.getMetadata(), PropertySource.class, PropertySources.class, true)) {
+    if (this.propertySourceRegistry != null) {
+        this.propertySourceRegistry.processPropertySource(propertySource);
+    }
+}
+// 随后才处理 @ComponentScan
+```
 
 真正插入在 `PropertySourceProcessor.addPropertySource`（`fw:spring-core/.../io/support/PropertySourceProcessor.java` 第 136–142 行）：
 
@@ -636,7 +859,18 @@ Boot 文档第 468–503 行把 Kubernetes 的两种挂载写清楚了：
 ## 6.6 不要做的事
 
 - 不要在 Nacos 正文里写 `spring.config.import` 或 `spring.profiles.active`。Loader 给每份 Nacos 数据加了 `IGNORE_IMPORTS` 和 `IGNORE_PROFILES`（第七章）。写了也不会展开，人会以为生效了。
-- 不要再引入 `spring-cloud-starter-bootstrap` 来加载 Nacos。2025.1 的自动配置在检测到 bootstrap 标记类时直接警告：这个依赖会让 Nacos Config 不能正常工作（`NacosConfigSpringCloudAutoConfiguration.java` 第 57–64 行）。
+- 不要再引入 `spring-cloud-starter-bootstrap` 来加载 Nacos。2025.1 的自动配置在检测到 bootstrap 标记类时直接警告：这个依赖会让 Nacos Config 不能正常工作。
+
+```java
+@ConditionalOnClass(name = "org.springframework.cloud.bootstrap.marker.Marker")
+static class BootstrapDetectionConfiguration {
+    BootstrapDetectionConfiguration() {
+        LoggerFactory.getLogger(BootstrapDetectionConfiguration.class)
+            .warn("Including 'org.springframework.cloud:spring-cloud-starter-bootstrap' will prevent Nacos Config from working properly."
+                + "Please remove this dependency. ... issues/4259");
+    }
+}
+```
 - 不要用 `@PropertySource` 承载会在启动早期被读取的属性。
 - 不要用"把值设成空字符串"以外的方式指望 `null` 去清空低优先级配置。`null` 会被跳过。要盖掉，给一个明确的空串或业务上的默认字面量。
 
@@ -655,13 +889,42 @@ org.springframework.boot.context.config.ConfigDataLoader=
     com.alibaba.cloud.nacos.configdata.NacosConfigDataLoader
 ```
 
-解析器的前缀是字面量 `nacos:`（`NacosConfigDataLocationResolver.java` 第 64 行），`getOrder()` 返回 `-1`（第 77–79 行），早于兜底的 `StandardConfigDataLocationResolver`（那个的 order 是 `LOWEST_PRECEDENCE`）。`spring.cloud.nacos.config.enabled` 默认 true（`isResolvable` 第 128–130 行 `orElse(true)`）。
+解析器的前缀、顺序和「非 profile 阶段不加载」：
 
-`resolve(...)` 对非 profile 阶段直接返回空列表（第 138–142 行）。真正的加载发生在 `resolveProfileSpecific`（第 146–163 行）：此时 Binder 已经能看到父文档和环境变量，所以 `spring.cloud.nacos.*` 可以写在**同一份** `application.yml` 里，和 `spring.config.import` 放在一起。
+```java
+public static final String PREFIX = "nacos:";
+private static final String GROUP = "group";
+private static final String REFRESH_ENABLED = "refreshEnabled";
+private static final String PREFERENCE = "preference";
+
+public int getOrder() {
+    return -1;
+}
+
+public List<NacosConfigDataResource> resolve(...) {
+    return Collections.emptyList();
+}
+```
+
+`spring.cloud.nacos.config.enabled` 默认 true（`isResolvable` 里 `orElse(true)`）。真正的加载发生在 `resolveProfileSpecific`：此时 Binder 已经能看到父文档和环境变量，所以 `spring.cloud.nacos.*` 可以写在同一份 `application.yml` 里，和 `spring.config.import` 放在一起。
 
 dataId 就是 URI 路径上的那一段，**不会**自动拼 `-{profile}`：
 
-【源码证据】`NacosConfigDataLocationResolver.java` `dataIdFor` 第 280–290 行：路径去掉前导 `/` 后必须恰好一段，否则抛 `illegal dataId`。`loadConfigDataResources` 第 193–198 行把这段原样放进 `NacosItemConfig.dataId`。
+【源码证据】`NacosConfigDataLocationResolver.java` `dataIdFor`：路径去掉前导 `/` 后必须恰好一段，否则抛 `illegal dataId`。这段原样成为 dataId，不会再拼 `-{profile}`。
+
+```java
+private @Nullable String dataIdFor(URI uri) {
+    String path = uri.getPath();
+    if (path == null || path.length() <= 1) {
+        return StringUtils.EMPTY;
+    }
+    String[] parts = path.substring(1).split("/");
+    if (parts.length != 1) {
+        throw new IllegalArgumentException("illegal dataId");
+    }
+    return parts[0];
+}
+```
 
 旧文章里的"自动加载 `${spring.application.name}.yml` 和 `${spring.application.name}-${profile}.yml`"来自已经不在当前分支的 `NacosPropertySourceLocator`。现在要哪份 dataId，就在 `spring.config.import` 里写哪一条。
 
@@ -679,9 +942,21 @@ NacosPropertySourceRepository.collectNacosPropertySource(propertySource);
 return new ConfigData(Collections.singletonList(propertySource), getOptions(...));
 ```
 
-2025.1 把解析结果收成**一个** `NacosPropertySource` 再交给 Boot。名字是 `dataId + "," + group`（`NacosPropertySource.java` 第 69 行 `String.join(",", dataId, group)`）。
+2025.1 把解析结果收成一个 `NacosPropertySource` 再交给 Boot。名字是 `dataId + "," + group`：
 
-同一份 dataId 里如果有多个 YAML 文档，`getSourceMap` 按文档顺序 `putAll`（第 96–108 行），后一个文档的同名 key 覆盖前一个。效果和 Boot 自己的"后文档优先"一致，但对外只剩一个 PropertySource，刷新时也是整份替换。
+```java
+super(String.join(NacosConfigProperties.COMMAS, dataId, group), source);
+```
+
+同一份 dataId 里如果有多个 YAML 文档，`getSourceMap` 按文档顺序 `putAll`，后一个文档的同名 key 覆盖前一个。效果和 Boot 自己的「后文档优先」一致，但对外只剩一个 PropertySource，刷新时也是整份替换。
+
+```java
+for (PropertySource<?> propertySource : propertySources) {
+    if (propertySource instanceof MapPropertySource mapPropertySource) {
+        sourceMap.putAll(mapPropertySource.getSource());
+    }
+}
+```
 
 2023.x 的 `doLoad`（`sca2023:.../NacosConfigDataLoader.java` 第 90 行）返回的是解析出的 `propertySources` 列表本身，不包一层。多文档会变成多个贡献者，由 Boot 的倒序决定优先级。胜者相同，`/actuator/env` 里看到的条目数不同。
 
@@ -695,14 +970,61 @@ if (getPreference(...) == REMOTE) {
 }
 ```
 
-`preference` 默认 `LOCAL`（第 148–150 行 `orElse(LOCAL)`）。单条 import 的查询参数 `preference=remote` 可以盖过全局值（第 151–154 行）。非法取值打错误日志并退回默认（第 156–160 行）。
+`preference` 默认 `LOCAL`。单条 import 的查询参数 `preference=remote` 可以盖过全局值。非法取值打错误日志并退回当前默认。
 
-`ConfigPreference` 的类注释把语义写明了（`ConfigPreference.java` 第 19–31 行）：
+```java
+ConfigPreference preference = binder
+        .bind(prefix + ".config.preference", ConfigPreference.class)
+        .orElse(LOCAL);
+String specificPreference = resource.getConfig().getPreference();
+if (StringUtils.isNotEmpty(specificPreference)) {
+    try {
+        preference = ConfigPreference.valueOf(specificPreference.toUpperCase(Locale.ROOT));
+    }
+    catch (IllegalArgumentException ignore) {
+        log.error(String.format(
+                "illegal preference value: %s, using default preference: %s",
+                specificPreference, preference));
+    }
+}
+return preference;
+```
+
+`ConfigPreference` 的类注释：
+
+```java
+/**
+ * When configured profile specific configuration, local config will override the remote,
+ * because the local config is profile specific, it has higher priority.
+ * So give remote config a chance to "win", we treat remote config as profile specific.
+ */
+public enum ConfigPreference {
+    LOCAL,
+    REMOTE
+}
+```
 
 - `LOCAL`：本地 profile 文件高于远程，因为本地 profile 文件带 `PROFILE_SPECIFIC`。
 - `REMOTE`：把远程数据也标成 profile 级，让它压过本地 profile 文件。
 
-对应到第三章的树：`PROFILE_SPECIFIC` 的子节点会被 `moveProfileSpecific`（`ConfigDataEnvironmentContributor.java` 第 272–284 行）从"普通阶段"挪到"profile 阶段"的列表前部。profile 阶段先被 `addLast`，所以：
+对应到第三章的树：`PROFILE_SPECIFIC` 的子节点会被 `moveProfileSpecific` 从普通阶段挪到 profile 阶段的列表前部。profile 阶段先被 `addLast`。
+
+```java
+private void moveProfileSpecific(Map<ImportPhase, List<ConfigDataEnvironmentContributor>> children) {
+    List<ConfigDataEnvironmentContributor> before = children.get(ImportPhase.BEFORE_PROFILE_ACTIVATION);
+    if (!hasAnyProfileSpecificChildren(before)) {
+        return;
+    }
+    List<ConfigDataEnvironmentContributor> updatedBefore = new ArrayList<>(before.size());
+    List<ConfigDataEnvironmentContributor> updatedAfter = new ArrayList<>();
+    for (ConfigDataEnvironmentContributor contributor : before) {
+        updatedBefore.add(moveProfileSpecificChildren(contributor, updatedAfter));
+    }
+    updatedAfter.addAll(children.getOrDefault(ImportPhase.AFTER_PROFILE_ACTIVATION, Collections.emptyList()));
+    children.put(ImportPhase.BEFORE_PROFILE_ACTIVATION, updatedBefore);
+    children.put(ImportPhase.AFTER_PROFILE_ACTIVATION, updatedAfter);
+}
+```
 
 | preference | 这条 Nacos dataId 的位置 |
 |---|---|
@@ -730,9 +1052,30 @@ if (getPreference(...) == REMOTE) {
 
 最后一行需要单独说。2023.x 与 2025.1.x 的 `NacosConfigDataLocationResolver` 都只加载 URI 里的那一个 dataId。`shared-configs`、`extension-configs` 留在属性类里，是旧 bootstrap 模型的字段。现在表达"公共配置 + 应用配置 + 扩展配置"的方式，是多条 `spring.config.import`，靠后的优先。不要在新项目里配 `shared-configs` 然后以为它会加载。
 
-2025.1 的 `pullConfig` 会先看 `NacosSnapshotConfigManager` 里的快照，没有再 `configService.getConfig`（`NacosConfigDataLoader.java` 第 166–178 行）。这是刷新路径把新正文放进快照、避免同一次刷新再打一次查询用的。2023.x 的 `pullConfig`（第 139–146 行）没有这一步，直接 `getConfig`。
+2025.1 的 `pullConfig` 会先看快照，没有再 `configService.getConfig`。这是刷新路径把新正文放进快照、避免同一次刷新再打一次查询用的。
 
-解析失败方面，2025.1 把 SnakeYAML 的 `DuplicateKeyException` 单独抛成 `NacosConfigParseException`，避免被当成"资源不存在"然后被 `optional:` 悄悄吞掉（第 109–117 行）。YAML 里重复 key 在 Nacos 上应该让启动失败。
+```java
+String config = NacosSnapshotConfigManager.getAndRemoveConfigSnapshot(namespace, dataId, group);
+if (config == null) {
+    config = configService.getConfig(dataId, group, timeout);
+}
+```
+
+2023.x 的 `pullConfig` 没有这一步，直接 `getConfig`。
+
+解析失败方面，2025.1 把 SnakeYAML 的 `DuplicateKeyException` 单独抛成 `NacosConfigParseException`，避免被当成「资源不存在」然后被 `optional:` 悄悄吞掉：
+
+```java
+if (e instanceof DuplicateKeyException) {
+    NacosItemConfig unparseable = resource.getConfig();
+    throw new NacosConfigParseException(unparseable.getDataId(), unparseable.getGroup(), e);
+}
+if (!resource.isOptional()) {
+    throw new ConfigDataResourceNotFoundException(resource, e);
+}
+```
+
+YAML 里重复 key 在 Nacos 上应该让启动失败。
 
 ## 7.4 推荐的依赖与配置
 
@@ -855,21 +1198,738 @@ defaultProperties
 
 ## 7.6 改完配置如何进到 Bean
 
-启动拉一次，之后靠监听。
+控制台点发布之后，进程里生效的是同一条查找规则上的一次换内容：客户端把新正文送进内存，Spring 再用同名的 `NacosPropertySource` 盖住原来那一格，然后重新绑定还在问 `Environment` 的 Bean。格子的下标不动，所以比它高的来源继续赢。
 
-1. `NacosConfigAutoConfiguration` 注册 `NacosContextRefresher`（第 69–76 行）。
-2. 应用 `ApplicationReadyEvent` 之后，refresher 遍历 `NacosPropertySourceRepository` 里 `refreshable` 的源，对每个 `(dataId, group)` 调用 `configService.addListener`（`NacosContextRefresher.java` 第 87–112、151 行）。`refreshEnabled=false` 的 dataId 跳过（第 106–108 行）。全局 `refresh-enabled` 默认 true。
-3. 回调里把新正文放进 `NacosSnapshotConfigManager`，再发布 `NacosConfigRefreshEvent`（第 120–136 行）。
-4. starter 模块里的 `NacosConfigRefreshEventListener`（`spring-cloud-starter-alibaba-nacos-config`）把该事件转成 Spring Cloud 的 `RefreshEvent`（监听器第 42–54 行）。
-5. Spring Cloud 的 `ContextRefresher` 收到 `RefreshEvent` 后刷新 Environment，并 rebind `@ConfigurationProperties`、重建 `@RefreshScope` 里的 Bean。
+下面按时间顺序写。行号分别来自 nacos-client 3.1.1、SCA `2025.1.x`、spring-cloud-commons `4.3.x`（Spring Cloud 2025.1 这一代用的 context 模块）、spring-framework 7.1 的 `MutablePropertySources`。
 
-因此业务上：
+### 原理：推送只负责叫醒，正文是客户端自己拉的
 
-- 会变的配置写成 `@ConfigurationProperties`，或把依赖它的 Bean 标成 `@RefreshScope`。
-- 构造期就读进普通字段的 `@Value` 不会因为 Nacos 推送而变。监听是在 Ready 之后才注册的，启动过程中的那一次拉取才是这些字段的值。
-- `NacosConfigSpringCloudAutoConfiguration` 在非默认刷新行为下会用 `SmartConfigurationPropertiesRebinder` 替换全量 rebind（第 42–48 行）。类注释写明默认仍是 Spring Cloud 的全量刷新，按 key 局部刷新是进阶开关，稳定性注释里作者自己标了"不如默认行为稳"。生产保持默认全量刷新即可。
+应用和 Nacos 之间已经有一条 gRPC 长连接。控制台发布之后，服务端在这条连接上推来的 `ConfigChangeNotifyRequest` 只有三个字段：
 
-服务端如何把变更推到这条监听（gRPC 监听、dump、灰度版本）见《Spring Cloud Alibaba Nacos.md》第五、六章。本文的优先级不随推送改变：刷新替换的是**同名** `NacosPropertySource` 的内容，它在列表上的位置仍是启动时 ConfigData 定下来的位置。环境变量在刷新之后依然高于它。
+```java
+// nacos 3.1.1 api/.../ConfigChangeNotifyRequest.java
+public class ConfigChangeNotifyRequest extends ServerRequest {
+    String dataId;
+    String group;
+    String tenant;
+
+    public static ConfigChangeNotifyRequest build(String dataId, String group, String tenant) {
+        ConfigChangeNotifyRequest request = new ConfigChangeNotifyRequest();
+        request.setDataId(dataId);
+        request.setGroup(group);
+        request.setTenant(tenant);
+        return request;
+    }
+}
+```
+
+客户端收到后不读正文，只改标志、摇铃、回空响应：
+
+```java
+// nacos-client 3.1.1 ClientWorker.java  handleConfigChangeNotifyRequest
+LOGGER.info("[{}] [server-push] config changed. dataId={}, group={},tenant={}", clientName,
+        configChangeNotifyRequest.getDataId(), configChangeNotifyRequest.getGroup(),
+        configChangeNotifyRequest.getTenant());
+String groupKey = GroupKey.getKeyTenant(configChangeNotifyRequest.getDataId(),
+        configChangeNotifyRequest.getGroup(), configChangeNotifyRequest.getTenant());
+CacheData cacheData = cacheMap.get().get(groupKey);
+if (cacheData != null) {
+    synchronized (cacheData) {
+        cacheData.getReceiveNotifyChanged().set(true);
+        cacheData.setConsistentWithServer(false);
+        notifyListenConfig();
+    }
+}
+return new ConfigChangeNotifyResponse();
+```
+
+正文要再走两跳才进进程。
+
+铃响之后，客户端把本地 md5 放进 `ConfigBatchListenRequest`。服务端只把 md5 已经过期的名字放进响应：
+
+```java
+// nacos 3.1.1 ConfigChangeBatchListenRequestHandler.java
+if (configChangeListenRequest.isListen()) {
+    configChangeListenContext.addListen(groupKey, md5, connectionId, isNeedTransferNamespace);
+    boolean isUptoDate = ConfigCacheService.isUptodate(groupKey, md5, meta.getClientIp(), tag,
+            meta.getAppLabels());
+    if (!isUptoDate) {
+        configChangeBatchListenResponse.addChangeConfig(listenContext.getDataId(), listenContext.getGroup(),
+                listenContext.getTenant());
+    }
+}
+```
+
+客户端对每个过期 dataId 再发 `ConfigQueryRequest`，这次响应里才是全文。写入 `CacheData` 时 md5 跟着重算：
+
+```java
+// ClientWorker.java  queryConfigInner
+ConfigQueryRequest request = ConfigQueryRequest.build(dataId, group, tenant);
+ConfigQueryResponse response = (ConfigQueryResponse) requestProxy(rpcClient, request, readTimeouts);
+if (response.isSuccess()) {
+    LocalConfigInfoProcessor.saveSnapshot(this.getName(), dataId, group, tenant, response.getContent());
+    configResponse.setContent(response.getContent());
+    return configResponse;
+}
+```
+
+```java
+// CacheData.java
+public void setContent(String content) {
+    this.content = content;
+    this.md5 = getMd5String(this.content);
+}
+```
+
+md5 和监听器上次回调时的 md5 不同，才调用 Spring 注册的 `Listener`。
+
+所以「Nacos 推送到应用」指的是叫醒。配置内容是叫醒之后的回源查询。推送丢了也还有兜底：监听线程最多 5 秒醒一次，并且每 3 分钟把所有监听项再对一次 md5。已标记为与服务器一致的项，在这 3 分钟之内不会重复去问。
+
+```java
+// ClientWorker.java
+private static final long ALL_SYNC_INTERNAL = 3 * 60 * 1000L;
+
+// startInternal 里的监听线程
+listenExecutebell.poll(5L, TimeUnit.SECONDS);
+executeConfigListen();
+
+// executeConfigListen：已对齐的项，不到 3 分钟就跳过
+if (cache.isConsistentWithServer()) {
+    cache.checkListenerMd5();
+    if (!needAllSync) {
+        continue;
+    }
+}
+```
+
+### 调用路径
+
+下面每一步都是上一层的直接调用。服务端行号是 Nacos 3.1.1，客户端行号是 nacos-client 3.1.1。
+
+**A. 订阅先挂上，否则后面没人可推。**
+
+应用 Ready 之后 `NacosContextRefresher` 对每个可刷新的 dataId 调用 `configService.addListener`（见下面 G）。`NacosConfigService.addListener` 转到 `ClientWorker.addTenantListeners`：
+
+```java
+// NacosConfigService.java
+public void addListener(String dataId, String group, Listener listener) throws NacosException {
+    worker.addTenantListeners(dataId, group, Collections.singletonList(listener));
+}
+
+// ClientWorker.java  addTenantListeners
+CacheData cache = addCacheDataIfAbsent(dataId, group, tenant);
+synchronized (cache) {
+    for (Listener listener : listeners) {
+        cache.addListener(listener);
+    }
+    cache.setDiscard(false);
+    cache.setConsistentWithServer(false);
+    if (getCache(dataId, group, tenant) != cache) {
+        putCache(GroupKey.getKeyTenant(dataId, group, tenant), cache);
+    }
+    agent.notifyListenConfig();
+}
+```
+
+监听线程从铃上醒来，进入 `executeConfigListen`。这份缓存还没和服务器对齐，被放进 `ConfigBatchListenRequest`，`listen=true`。服务端把 `connectionId → groupKey` 写进 `ConfigChangeListenContext`。这张表就是以后推送时的收件人名单。
+
+```java
+// ClientWorker.java  checkListenCache
+ConfigBatchListenRequest configChangeListenRequest = buildConfigRequest(listenCaches);
+configChangeListenRequest.setListen(true);
+ConfigChangeBatchListenResponse listenResponse = (ConfigChangeBatchListenResponse) requestProxy(
+        rpcClient, configChangeListenRequest);
+```
+
+```java
+// ConfigChangeBatchListenRequestHandler.java
+configChangeListenContext.addListen(groupKey, md5, connectionId, isNeedTransferNamespace);
+```
+
+首次注册时若 md5 已落后，响应里会带上 dataId，客户端当场拉一次全文。启动时 `pullConfig` 已经拉过，这次多半只是把订阅登记上去。
+
+**B. 控制台发布，本节点 dump 成功后才允许通知。**
+
+发布写完 DB 后调用 `ConfigChangePublisher.notifyConfigChange`。外置库模式下它发布 `ConfigDataChangeEvent`；内嵌 Derby 的集群模式直接 return，因为写路径已经走了 JRaft：
+
+```java
+// ConfigChangePublisher.java
+public static void notifyConfigChange(ConfigDataChangeEvent event) {
+    if (DatasourceConfiguration.isEmbeddedStorage() && !EnvUtil.getStandaloneMode()) {
+        return;
+    }
+    NotifyCenter.publishEvent(event);
+}
+```
+
+`DumpService` 订阅这个事件，转成 `dump`。`dumpWithMd5` 在 md5 变化时写磁盘并 `updateMd5`。`updateMd5` 发现 md5 真的变了，才发布 `LocalDataChangeEvent`。md5 没变就不会发这个事件，客户端也就不会被叫醒。
+
+```java
+// DumpService.java
+NotifyCenter.registerSubscriber(new Subscriber() {
+    public void onEvent(Event event) {
+        handleConfigDataChange(event);
+    }
+    public Class<? extends Event> subscribeType() {
+        return ConfigDataChangeEvent.class;
+    }
+});
+
+void handleConfigDataChange(Event event) {
+    if (event instanceof ConfigDataChangeEvent) {
+        ConfigDataChangeEvent evt = (ConfigDataChangeEvent) event;
+        DumpRequest dumpRequest = DumpRequest.create(evt.dataId, evt.group, evt.tenant, evt.lastModifiedTs,
+                NetUtils.localIp());
+        DumpService.this.dump(dumpRequest);
+    }
+}
+
+public void dump(DumpRequest dumpRequest) {
+    if (StringUtils.isNotBlank(dumpRequest.getGrayName())) {
+        dumpGray(...);
+    } else {
+        dumpFormal(...);
+    }
+}
+```
+
+```java
+// ConfigCacheService.java  dumpWithMd5 里 md5 变了才更新内存
+if (md5Changed) {
+    ConfigDiskServiceFactory.getInstance().saveToDisk(dataId, group, tenant, content);
+    updateMd5(groupKey, md5, content, lastModifiedTs, encryptedDataKey);
+}
+
+public static void updateMd5(...) {
+    CacheItem cache = makeSure(groupKey, encryptedDataKey);
+    ConfigCache configCache = cache.getConfigCache();
+    if (configCache.getMd5() == null || !configCache.getMd5().equals(md5)) {
+        configCache.setMd5(md5);
+        configCache.setLastModifiedTs(lastModifiedTs);
+        configCache.setEncryptedDataKey(encryptedDataKey);
+        ConfigCachePostProcessorDelegate.getInstance().postProcess(configCache, content);
+        NotifyCenter.publishEvent(new LocalDataChangeEvent(groupKey));
+    }
+}
+```
+
+集群里，写库的节点通过 `AsyncNotifyService` 把 `ConfigChangeClusterSyncRequest` 发给其他成员，对方各自再 dump 一次，从而各自发出自己的 `LocalDataChangeEvent`。推给应用的是握着这条 gRPC 连接的那个节点，因为收件人名单 `ConfigChangeListenContext` 只在本节点内存里。
+
+```java
+// AsyncNotifyService.java
+Collection<Member> ipList = memberManager.allMembersWithoutSelf();
+ConfigChangeClusterSyncRequest syncRequest = new ConfigChangeClusterSyncRequest();
+```
+
+**C. 服务端按连接推一个不含正文的请求。**
+
+`RpcConfigChangeNotifier` 订阅 `LocalDataChangeEvent`。`onEvent` 解析出 dataId、group、tenant，调用 `configDataChanged`。收件人来自 `getListeners(groupKey)`。组包仍然只有三个字段，经 `pushWithCallback` 写进那条连接的双向流。失败按 `maxPushRetryTimes` 重试。
+
+```java
+// RpcConfigChangeNotifier.java
+public void onEvent(LocalDataChangeEvent event) {
+    String groupKey = event.groupKey;
+    String[] strings = GroupKey.parseKey(groupKey);
+    String dataId = strings[0];
+    String group = strings[1];
+    String tenant = strings.length > 2 ? strings[2] : "";
+    configDataChanged(groupKey, dataId, group, tenant);
+}
+
+public void configDataChanged(String groupKey, String dataId, String group, String tenant) {
+    Set<String> listeners = configChangeListenContext.getListeners(groupKey);
+    if (CollectionUtils.isEmpty(listeners)) {
+        return;
+    }
+    for (final String client : listeners) {
+        Connection connection = connectionManager.getConnection(client);
+        if (connection == null) {
+            continue;
+        }
+        ConfigChangeNotifyRequest notifyRequest = ConfigChangeNotifyRequest.build(dataId, group, tenant);
+        RpcPushTask rpcPushRetryTask = new RpcPushTask(notifyRequest,
+                ConfigCommonConfig.getInstance().getMaxPushRetryTimes(), client, clientIp, metaInfo.getAppName());
+        push(rpcPushRetryTask, connectionManager);
+    }
+}
+
+// RpcPushTask.run
+rpcPushService.pushWithCallback(connectionId, notifyRequest,
+        new RpcPushCallback(this, tpsControlManager, connectionManager),
+        ConfigExecutor.getClientConfigNotifierServiceExecutor());
+```
+
+```java
+// RpcPushService.java
+public void pushWithCallback(String connectionId, ServerRequest request, PushCallBack requestCallBack,
+        Executor executor) {
+    Connection connection = connectionManager.getConnection(connectionId);
+    if (connection != null) {
+        connection.asyncRequest(request, new AbstractRequestCallBack(requestCallBack.getTimeout()) { ... });
+    }
+}
+```
+
+**D. 客户端收到推送，只改两个标志并摇铃。**
+
+连接建立时 `initRpcClientHandler` 把服务端请求接到 `handleConfigChangeNotifyRequest`。这个方法打 `[server-push]` 日志，改两个标志，摇铃，然后返回空响应。推送这一跳到此结束，配置正文还没进应用。
+
+```java
+// ClientWorker.java  initRpcClientHandler
+rpcClientInner.registerServerRequestHandler((request, connection) -> {
+    if (request instanceof ConfigChangeNotifyRequest) {
+        return handleConfigChangeNotifyRequest((ConfigChangeNotifyRequest) request,
+                rpcClientInner.getName());
+    }
+    return null;
+});
+
+// notifyListenConfig
+public void notifyListenConfig() {
+    listenExecutebell.offer(bellItem);
+}
+```
+
+`handleConfigChangeNotifyRequest` 的方法体见本节开头那一段：`receiveNotifyChanged=true`、`consistentWithServer=false`、`notifyListenConfig()`、`return new ConfigChangeNotifyResponse()`。
+
+**E. 铃响后对 md5，再按名字回源拉全文。**
+
+`startInternal` 里的单线程 `com.alibaba.nacos.client.listen-executor` 从 `poll(5, SECONDS)` 返回，调用 `executeConfigListen`。这份 `CacheData` 的 `consistentWithServer` 已是 false，所以它进入本轮的 `listenCachesMap`。`checkListenCache` 先把 `receiveNotifyChanged` 清掉，再发 `ConfigBatchListenRequest`。
+
+```java
+// ClientWorker.java  executeConfigListen
+checkLocalConfig(cache);
+if (cache.isConsistentWithServer()) {
+    cache.checkListenerMd5();
+    if (!needAllSync) {
+        continue;
+    }
+}
+if (cache.isUseLocalConfigInfo()) {
+    continue;
+}
+if (!cache.isDiscard()) {
+    listenCachesMap.computeIfAbsent(String.valueOf(cache.getTaskId()), k -> new LinkedList<>()).add(cache);
+}
+boolean hasChangedKeys = checkListenCache(listenCachesMap);
+```
+
+```java
+// checkListenCache：先清标志，再发批量监听
+for (CacheData cacheData : listenCaches) {
+    cacheData.getReceiveNotifyChanged().set(false);
+}
+ConfigBatchListenRequest configChangeListenRequest = buildConfigRequest(listenCaches);
+configChangeListenRequest.setListen(true);
+```
+
+服务端对每一项做 `isUptodate`。md5 对不上就把 dataId、group、tenant 放进 `addChangeConfig`（代码见本节开头）。客户端拿到 `changedConfigs` 后，对每个 changeKey 调用 `refreshContentAndCheck`。若在这次批量请求期间又来了一记推送（标志被重新置上），而响应里没列出这个 key，会再补拉一次。
+
+```java
+// ClientWorker.java  checkListenCache 收到响应之后
+List<ConfigChangeBatchListenResponse.ConfigContext> changedConfigs = listenResponse.getChangedConfigs();
+if (!CollectionUtils.isEmpty(changedConfigs)) {
+    hasChangedKeys.set(true);
+    for (ConfigChangeBatchListenResponse.ConfigContext changeConfig : changedConfigs) {
+        String changeKey = GroupKey.getKeyTenant(changeConfig.getDataId(),
+                changeConfig.getGroup(), changeConfig.getTenant());
+        changeKeys.add(changeKey);
+        boolean isInitializing = cacheMap.get().get(changeKey).isInitializing();
+        refreshContentAndCheck(rpcClient, changeKey, !isInitializing);
+    }
+}
+for (CacheData cacheData : listenCaches) {
+    if (cacheData.getReceiveNotifyChanged().get()) {
+        String changeKey = GroupKey.getKeyTenant(cacheData.dataId, cacheData.group, cacheData.getTenant());
+        if (!changeKeys.contains(changeKey)) {
+            boolean isInitializing = cacheMap.get().get(changeKey).isInitializing();
+            refreshContentAndCheck(rpcClient, changeKey, !isInitializing);
+        }
+    }
+}
+```
+
+`refreshContentAndCheck` 调 `queryConfigInner`（`ConfigQueryRequest`，成功则 `saveSnapshot`，见本节开头），然后 `setContent` 重算 md5，再 `checkListenerMd5`：
+
+```java
+// ClientWorker.java  refreshContentAndCheck
+ConfigResponse response = this.queryConfigInner(rpcClient, cacheData.dataId, cacheData.group,
+        cacheData.tenant, requestTimeout, notify);
+cacheData.setEncryptedDataKey(response.getEncryptedDataKey());
+cacheData.setContent(response.getContent());
+if (null != response.getConfigType()) {
+    cacheData.setType(response.getConfigType());
+}
+cacheData.checkListenerMd5();
+```
+
+**F. md5 变了才进入 Spring 的 Listener。**
+
+`checkListenerMd5` 只在 md5 和该监听器上次不同时回调。`safeNotifyListener` 先 `fillContext`，再 `receiveConfigInfo`。SCA 的监听器 `getExecutor()` 返回 null，所以回调就在 Nacos 这条线程上执行。`receiveConfigInfo` 是 final 方法，直接进 `innerReceive`。
+
+```java
+// CacheData.java
+void checkListenerMd5() {
+    for (ManagerListenerWrap wrap : listeners) {
+        if (!md5.equals(wrap.lastCallMd5)) {
+            safeNotifyListener(dataId, group, content, type, md5, encryptedDataKey, wrap);
+        }
+    }
+}
+
+// safeNotifyListener 里
+if (listener instanceof AbstractSharedListener) {
+    AbstractSharedListener adapter = (AbstractSharedListener) listener;
+    adapter.fillContext(dataId, group);
+}
+listener.receiveConfigInfo(contentTmp);
+
+if (null != listener.getExecutor()) {
+    listener.getExecutor().execute(job);
+} else {
+    job.run();   // AbstractSharedListener.getExecutor() 返回 null，走这里
+}
+```
+
+```java
+// AbstractSharedListener.java
+public final void receiveConfigInfo(String configInfo) {
+    innerReceive(dataId, group, configInfo);
+}
+
+public Executor getExecutor() {
+    return null;
+}
+
+public abstract void innerReceive(String dataId, String group, String configInfo);
+```
+
+从这里起才是 Spring 侧。`innerReceive` 拿到的 `configInfo` 就是上面 `ConfigQueryRequest` 拉回来的全文。
+
+监听注册时 `addListener` 以当时的 md5 作为 `lastCallMd5`。Ready 之前已经发生、且之后 md5 不再变化的那一次发布，不会再回调。
+
+```java
+// CacheData.java  addListener
+if (listener instanceof AbstractConfigChangeListener) {
+    wrap = new ManagerListenerWrap(listener, md5, contentTmp);
+} else {
+    wrap = new ManagerListenerWrap(listener, md5);
+}
+```
+
+**G. `innerReceive` 之后的 Spring 调用。**
+
+SCA 注册的就是 `AbstractSharedListener` 的匿名子类。注册发生在 `ApplicationReadyEvent` 之后，并且只做一次。跳过 `isRefreshable()==false` 的源，对其余源 `configService.addListener`。这个仓库里的源是启动时 `doLoad` 放进去的，所以监听集合等于当时成功 import 且允许刷新的 dataId。`addListener` 的客户端后果就是上面的 A。
+
+```java
+// NacosContextRefresher.java
+public void onApplicationEvent(ApplicationReadyEvent event) {
+    if (this.ready.compareAndSet(false, true)) {
+        this.registerNacosListenersForApplications();
+    }
+}
+
+private void registerNacosListenersForApplications() {
+    if (isRefreshEnabled()) {
+        for (NacosPropertySource propertySource : NacosPropertySourceRepository.getAll()) {
+            if (!propertySource.isRefreshable()) {
+                continue;
+            }
+            String dataId = propertySource.getDataId();
+            registerNacosListener(propertySource.getGroup(), dataId);
+        }
+    }
+}
+
+// registerNacosListener 末尾
+configService.addListener(dataKey, groupKey, listener);
+```
+
+```java
+// NacosConfigDataLoader.java  doLoad：启动时把源收进仓库，Ready 之后才能被遍历到
+NacosPropertySource propertySource = new NacosPropertySource(propertySources,
+        config.getGroup(), config.getDataId(), new Date(), config.isRefreshEnabled());
+NacosPropertySourceRepository.collectNacosPropertySource(propertySource);
+```
+
+**G1. 回调先存快照再发事件，不直接改 `Environment`。**
+
+`innerReceive` 依次做四件事：打日志、计数、记历史、把全文放进快照，然后发布 `NacosConfigRefreshEvent`。它不改 `Environment`。快照的键是 `namespace@dataId@group`（`public` 或空 namespace 省略 namespace）。取出时 `remove`，用一次就没了。
+
+```java
+// NacosContextRefresher.java  匿名 AbstractSharedListener
+public void innerReceive(String dataId, String group, String configInfo) {
+    log.info("[Nacos Config] Receive Nacos config change: dataId={}, group={}", dataKey, groupKey);
+    refreshCountIncrement();
+    nacosRefreshHistory.addRefreshRecord(dataId, group, configInfo);
+    NacosSnapshotConfigManager.putConfigSnapshot(
+            nacosConfigProperties.getNamespace(), dataId, group, configInfo);
+    NacosConfigRefreshEvent event = new NacosConfigRefreshEvent(this, null, "Refresh Nacos config");
+    event.setDataId(dataId);
+    event.setGroup(group);
+    if (applicationContext != null) {
+        applicationContext.publishEvent(event);
+    }
+}
+```
+
+```java
+// NacosSnapshotConfigManager.java
+private static String formatConfigSnapshotKey(@Nullable String namespace, String dataId, String group) {
+    if (namespace == null || namespace.isEmpty()
+            || NacosConfigProperties.DEFAULT_NAMESPACE.equals(namespace)) {
+        return dataId + "@" + group;
+    }
+    return namespace + "@" + dataId + "@" + group;
+}
+
+public static @Nullable String getAndRemoveConfigSnapshot(@Nullable String namespace,
+        String dataId, String group) {
+    return CONFIG_INFO_SNAPSHOT_MAP.remove(formatConfigSnapshotKey(namespace, dataId, group));
+}
+
+public static void putConfigSnapshot(@Nullable String namespace, String dataId,
+        String group, String configInfo) {
+    String snapshotKey = formatConfigSnapshotKey(namespace, dataId, group);
+    if (configInfo == null) {
+        CONFIG_INFO_SNAPSHOT_MAP.remove(snapshotKey);
+    } else {
+        CONFIG_INFO_SNAPSHOT_MAP.put(snapshotKey, configInfo);
+    }
+}
+```
+
+**4. starter 把 Nacos 事件译成 Spring Cloud 的 `RefreshEvent`。**
+
+`NacosConfigSpringCloudAutoConfiguration` 注册 `NacosConfigRefreshEventListener`。该监听器只接 `NacosConfigRefreshEvent`，再发布 `RefreshEvent`：
+
+```java
+// NacosConfigSpringCloudAutoConfiguration.java
+@Bean(name = "nacosConfigSpringCloudRefreshEventListener")
+public NacosConfigRefreshEventListener nacosConfigRefreshEventListener() {
+    return new NacosConfigRefreshEventListener();
+}
+```
+
+```java
+// NacosConfigRefreshEventListener.java
+public boolean supportsEventType(Class<? extends ApplicationEvent> eventType) {
+    return NacosConfigRefreshEvent.class.isAssignableFrom(eventType);
+}
+
+public void onApplicationEvent(ApplicationEvent event) {
+    if (applicationContext != null) {
+        applicationContext.publishEvent(new RefreshEvent(event.getSource(), null, "Refresh Nacos config"));
+    }
+}
+```
+
+**5. `RefreshEvent` 在应用 Ready 之后才调用 `ContextRefresher.refresh()`。**
+
+`RefreshAutoConfiguration` 在 bootstrap 关闭时（当前 Nacos 就是这条路径，不要再引入 bootstrap starter）注册 `ConfigDataContextRefresher` 和 `RefreshEventListener`。监听器在 `ApplicationReadyEvent` 里把 `ready` 置位；收到 `RefreshEvent` 时若已 ready，调用 `refresh()`。
+
+```java
+// RefreshAutoConfiguration.java
+@Bean
+@ConditionalOnMissingBean
+@ConditionalOnBootstrapDisabled
+public ConfigDataContextRefresher configDataContextRefresher(...) {
+    return new ConfigDataContextRefresher(context, scope, properties);
+}
+
+@Bean
+public RefreshEventListener refreshEventListener(ContextRefresher contextRefresher) {
+    return new RefreshEventListener(contextRefresher);
+}
+
+// RefreshEventListener.java
+public void handle(ApplicationReadyEvent event) {
+    this.ready.compareAndSet(false, true);
+}
+
+public void handle(RefreshEvent event) {
+    if (this.ready.get()) {
+        Set<String> keys = this.refresh.refresh();
+        log.info("Refresh keys changed: " + keys);
+    }
+}
+```
+
+`refresh` 先刷新 Environment，再清掉 `@RefreshScope`。差集的抽取跳过 `systemProperties`、`systemEnvironment`、Servlet/JNDI、`configurationProperties`，所以 `-D` 和环境变量的值变化不会出现在这次「哪些键变了」的集合里。它们本来也不由这次 Nacos 推送改写。
+
+```java
+// ContextRefresher.java
+protected static final String[] DEFAULT_PROPERTY_SOURCES = new String[] {
+        CommandLinePropertySource.COMMAND_LINE_PROPERTY_SOURCE_NAME, "defaultProperties" };
+
+protected Set<String> standardSources = new HashSet<>(Arrays.asList(
+        StandardEnvironment.SYSTEM_PROPERTIES_PROPERTY_SOURCE_NAME,
+        StandardEnvironment.SYSTEM_ENVIRONMENT_PROPERTY_SOURCE_NAME,
+        StandardServletEnvironment.JNDI_PROPERTY_SOURCE_NAME,
+        StandardServletEnvironment.SERVLET_CONFIG_PROPERTY_SOURCE_NAME,
+        StandardServletEnvironment.SERVLET_CONTEXT_PROPERTY_SOURCE_NAME, "configurationProperties"));
+
+public synchronized Set<String> refresh() {
+    Set<String> keys = refreshEnvironment();
+    this.scope.refreshAll();
+    return keys;
+}
+
+public synchronized Set<String> refreshEnvironment() {
+    Map<String, Object> before = extract(this.context.getEnvironment().getPropertySources());
+    updateEnvironment();
+    Set<String> keys = changes(before, extract(this.context.getEnvironment().getPropertySources())).keySet();
+    this.context.publishEvent(new EnvironmentChangeEvent(this.context, keys));
+    return keys;
+}
+```
+
+**6. `updateEnvironment` 重跑 ConfigData，再用同名源 `replace`。**
+
+`ConfigDataContextRefresher.updateEnvironment` 做三件事：拷一份只留命令行和 `defaultProperties` 的新环境，把全部 `EnvironmentPostProcessor` 再跑一遍，再按名字把非标准源写回旧环境。
+
+```java
+// ConfigDataContextRefresher.java
+protected void updateEnvironment() {
+    StandardEnvironment environment = copyEnvironment(getContext().getEnvironment());
+    List<String> classNames = SpringFactoriesLoader.loadFactoryNames(EnvironmentPostProcessor.class,
+            getClass().getClassLoader());
+    List<EnvironmentPostProcessor> postProcessors = instantiator.instantiate(classNames);
+    for (EnvironmentPostProcessor postProcessor : postProcessors) {
+        postProcessor.postProcessEnvironment(environment, application);
+    }
+    MutablePropertySources target = getContext().getEnvironment().getPropertySources();
+    String targetName = null;
+    for (PropertySource<?> source : environment.getPropertySources()) {
+        String name = source.getName();
+        if (target.contains(name)) {
+            targetName = name;
+        }
+        if (!this.standardSources.contains(name)) {
+            if (target.contains(name)) {
+                target.replace(name, source);
+            }
+            else if (targetName != null) {
+                target.addAfter(targetName, source);
+                targetName = name;
+            }
+            else {
+                target.addFirst(source);
+                targetName = name;
+            }
+        }
+    }
+}
+```
+
+`copyEnvironment` 只从旧环境带走 `commandLineArgs` 和 `defaultProperties`，以及 active/default profile。新的 `StandardEnvironment` 自带全新的 `systemProperties` / `systemEnvironment`。
+
+```java
+// ContextRefresher.java  copyEnvironment
+List<String> propertySourcesToRetain = new ArrayList<>(Arrays.asList(DEFAULT_PROPERTY_SOURCES));
+for (String name : propertySourcesToRetain) {
+    if (input.getPropertySources().contains(name)) {
+        if (capturedPropertySources.contains(name)) {
+            capturedPropertySources.replace(name, input.getPropertySources().get(name));
+        } else {
+            capturedPropertySources.addLast(input.getPropertySources().get(name));
+        }
+    }
+}
+environment.setActiveProfiles(input.getActiveProfiles());
+environment.setDefaultProfiles(input.getDefaultProfiles());
+```
+
+重跑 ConfigData 时再次进入 `NacosConfigDataLoader.pullConfig`。快照里有正文就用它，没有才 `getConfig`。刚被推送的那一份走快照；同一次重放里其他没变的 Nacos dataId 快照为空，会再向服务端拉一次。
+
+```java
+// NacosConfigDataLoader.java  pullConfig
+String config = NacosSnapshotConfigManager.getAndRemoveConfigSnapshot(namespace, dataId, group);
+if (config == null) {
+    config = configService.getConfig(dataId, group, timeout);
+}
+```
+
+解析结果装进新的 `NacosPropertySource`。名字仍是 `dataId + "," + group`，和启动时那一格同名：
+
+```java
+// NacosPropertySource.java
+NacosPropertySource(String group, String dataId, Map<String, Object> source,
+        Date timestamp, boolean isRefreshable) {
+    super(String.join(NacosConfigProperties.COMMAS, dataId, group), source);
+    this.group = group;
+    this.dataId = dataId;
+    this.timestamp = timestamp;
+    this.isRefreshable = isRefreshable;
+}
+```
+
+`MutablePropertySources.replace` 在原下标换对象。第 9、13、14 行因此还在原来的位置，Map 换成新内容。
+
+```java
+// MutablePropertySources.java
+public void replace(String name, PropertySource<?> propertySource) {
+    synchronized (this.propertySourceList) {
+        int index = assertPresentAndGetIndex(name);
+        this.propertySourceList.set(index, propertySource);
+    }
+}
+```
+
+**7. 绑定层和 `@RefreshScope` 在事件之后更新。**
+
+`ConfigurationPropertiesRebinder` 在事件来源是本上下文时 `rebind()`。单个 Bean 是 `destroyBean` 再 `initializeBean`，初始化时重新从 `Environment` 绑定。类名或 Bean 名落在 `spring.cloud.refresh.never-refreshable` 里的跳过，默认包含 `HikariDataSource`。
+
+```java
+// ConfigurationPropertiesRebinder.java
+private boolean rebind(String name, ApplicationContext appContext) {
+    Object bean = appContext.getBean(name);
+    if (AopUtils.isAopProxy(bean)) {
+        bean = ProxyUtils.getTargetObject(bean);
+    }
+    if (getNeverRefreshable().contains(bean.getClass().getName()) || getNeverRefreshable().contains(name)) {
+        return false;
+    }
+    appContext.getAutowireCapableBeanFactory().destroyBean(bean);
+    appContext.getAutowireCapableBeanFactory().initializeBean(bean, name);
+    return true;
+}
+
+public void onApplicationEvent(EnvironmentChangeEvent event) {
+    if (this.applicationContext.equals(event.getSource())
+            || event.getKeys().equals(event.getSource())) {
+        rebind();
+    }
+}
+
+public Set<String> getNeverRefreshable() {
+    String neverRefresh = this.applicationContext.getEnvironment()
+        .getProperty("spring.cloud.refresh.never-refreshable", "com.zaxxer.hikari.HikariDataSource");
+    return StringUtils.commaDelimitedListToSet(neverRefresh);
+}
+```
+
+`RefreshScope.refreshAll` 丢掉 scope 内实例。标了 `@RefreshScope` 的 Bean 在下一次被使用时按新的 `Environment` 再建一份。
+
+```java
+// RefreshScope.java
+public void refreshAll() {
+    super.destroy();
+    this.context.publishEvent(new RefreshScopeRefreshedEvent());
+}
+```
+
+`NacosConfigSpringCloudAutoConfiguration` 里另有 `SmartConfigurationPropertiesRebinder`，注释写明默认仍是上面这条全量刷新，按 key 局部刷新是另开的开关。生产保持默认全量刷新。
+
+服务端落库和集群同步的细节见《Spring Cloud Alibaba Nacos.md》第五、六章。对 Spring 来说，生效的入口是客户端 `checkListenerMd5` 之后的 `innerReceive`：那时 `CacheData` 里已经是 `ConfigQueryRequest` 拉回来的全文。
+
+### 这条链上，什么会跟着变
+
+- 键只出现在被推送的那份 `dataId,group` 里，上面的命令行、`-D`、环境变量、jar 外文件、以及比它更靠前的 jar 内文件都没写这个键：`getProperty` 会读到新值，`@ConfigurationProperties` 重新绑定后字段也是新值。
+- 同一个键上面已经有值：Nacos 那一格的 Map 同样换成了新正文，查找仍在更高的那一格返回。`/actuator/env` 上能看到 Nacos 源里的新值，业务拿到的仍是上面的值。
+- `refreshEnabled=false` 的 dataId 不会进入第 2 步的 `addListener`，控制台发布不会走到这条链。
+- 普通单例里 `@Value` 注入的字段保持创建时的值。要跟着变，把配置放进 `@ConfigurationProperties`，或把使用方标成 `@RefreshScope`。
+- 监听注册时 `CacheData.addListener` 以当时的 md5 作为该监听器的 `lastCallMd5`（见上面 F 的 `addListener` 片段）。Ready 之前已经发生、且之后 md5 不再变化的那一次发布，不会再回调。启动时那次 `pullConfig` 已经把当时的正文放进了 Environment。
 
 ## 7.7 2023.x 和 2025.1.x 在优先级上的差异
 
@@ -971,6 +2031,10 @@ SPRING_DATASOURCE_PASSWORD=env-secret
 SPRING_CLOUD_NACOS_SERVER_ADDR=127.0.0.1:8848
 NACOS_NAMESPACE=<控制台里的命名空间 ID，不要写 public 这个显示名>
 ```
+
+`prod` 不是 Spring 的默认启动方式，上面这条 `java` 命令里也没有它。激活它的是进程环境里的 `SPRING_PROFILES_ACTIVE=prod`。这个变量进的是第 3 行 `systemEnvironment`，Boot 把它读成 `spring.profiles.active=prod`，于是才去加载各目录的 `application-prod.yml`。命令行里若再写 `--spring.profiles.active=prod`，那是第 1 行，会盖住这个环境变量。
+
+这个变量不设时，激活集合是空的，Framework 启用默认 profile 名 `default`，去找的是 `application-default.yml`，`application-prod.yml` 不会进列表。本例的 jar 内 `application.yml` 也没有写 `spring.profiles.active`。
 
 `ORDER_FROM` 能被当成 `order.from`，是 `systemEnvironment` 这份源自己做的下划线转换（第二章 2.6）。`SPRING_CLOUD_NACOS_SERVER_ADDR` 同理，Nacos 客户端靠它找到服务器，这个地址不能只写在 Nacos 里。
 
@@ -1158,11 +2222,49 @@ jar 内普通文件正好两份，表里都有，中间被 local Nacos 隔开了
 
 三份 Nacos 是同一次 import 拉下来的，但 Boot 不按“它们都叫 Nacos”排成相邻的三行。每一份 dataId 的位置由两件事决定：它挂在哪一份本地文件上，以及有没有被标成 profile 级。
 
-import 写在 jar 内的 `classpath:/application.yml`（第 15 行）。Boot 把导入结果当成这份文件的子节点：遍历时先看子节点，再看文件自己，所以子节点高于父文件（`ConfigDataEnvironmentContributor` 的迭代器，第 545–586 行，先子后己；`applyContributor` 第 356 行 `addLast`，先挂上的更高）。第 13、14 行因此在第 15 行上面。两条 local 之间，import 列表靠后的更高，所以 `order-service.yaml` 高于 `common.yaml`。
+import 写在 jar 内的 `classpath:/application.yml`（第 15 行）。Boot 把导入结果当成这份文件的子节点：遍历时先看子节点，再看文件自己，所以子节点高于父文件。先被 `addLast` 的更高。第 13、14 行因此在第 15 行上面。两条 local 之间，import 列表靠后的更高，所以 `order-service.yaml` 高于 `common.yaml`。
 
-同一组位置里，profile 文件和普通文件分两个阶段。迭代器先走 `AFTER_PROFILE_ACTIVATION`（`application-prod.yml`），再走 `BEFORE_PROFILE_ACTIVATION`（`application.yml`）。所以在 **classpath 这一组内部**，第 10、11 行的 jar 内 profile 文件高于第 15 行，也高于仍然挂在第 15 行下面的第 13、14 行。
+```java
+// ConfigDataEnvironmentContributor.java  迭代器：先 profile 子节点，再普通子节点，最后才是自己
+if (this.phase == ImportPhase.AFTER_PROFILE_ACTIVATION) {
+    this.phase = ImportPhase.BEFORE_PROFILE_ACTIVATION;
+    this.children = getChildren(this.phase).iterator();
+    return fetchIfNecessary();
+}
+if (this.phase == ImportPhase.BEFORE_PROFILE_ACTIVATION) {
+    this.phase = null;
+    this.next = ConfigDataEnvironmentContributor.this;   // 父节点最后
+    return this.next;
+}
+```
 
-`preference=remote` 多做一步。`NacosConfigDataLoader.getOptions`（第 130–134 行）给这份数据加上 `Option.PROFILE_SPECIFIC`。`moveProfileSpecific`（`ConfigDataEnvironmentContributor.java` 第 272–284 行）把带这个标记的子节点从普通阶段摘出来，放到**同一组** profile 阶段的最前面，排在真正的 `application-prod.yml` 之前。第 9 行因此升到第 10、11 行之上。第 13、14 行没有这个标记，留在普通阶段，于是 jar 内 profile 文件就夹在 remote 和 local 中间：
+```java
+// ConfigDataEnvironment.java  applyContributor
+propertySources.addLast(propertySource);
+```
+
+同一组位置里，profile 文件和普通文件分两个阶段。迭代器先走 `AFTER_PROFILE_ACTIVATION`（`application-prod.yml`），再走 `BEFORE_PROFILE_ACTIVATION`（`application.yml`）。所以在 classpath 这一组内部，第 10、11 行的 jar 内 profile 文件高于第 15 行，也高于仍然挂在第 15 行下面的第 13、14 行。
+
+`preference=remote` 多做一步。`getOptions` 给这份数据加上 `Option.PROFILE_SPECIFIC`。`moveProfileSpecific` 把带这个标记的子节点从普通阶段摘出来，放到同一组 profile 阶段的最前面，排在真正的 `application-prod.yml` 之前。第 9 行因此升到第 10、11 行之上。第 13、14 行没有这个标记，留在普通阶段，于是 jar 内 profile 文件就夹在 remote 和 local 中间：
+
+```java
+// NacosConfigDataLoader.java
+options.add(Option.IGNORE_IMPORTS);
+options.add(Option.IGNORE_PROFILES);
+if (getPreference(context, resource) == REMOTE) {
+    options.add(Option.PROFILE_SPECIFIC);
+}
+```
+
+```java
+// ConfigDataEnvironmentContributor.java  moveProfileSpecific
+List<ConfigDataEnvironmentContributor> updatedAfter = new ArrayList<>();
+for (ConfigDataEnvironmentContributor contributor : before) {
+    updatedBefore.add(moveProfileSpecificChildren(contributor, updatedAfter));
+}
+updatedAfter.addAll(children.getOrDefault(ImportPhase.AFTER_PROFILE_ACTIVATION, Collections.emptyList()));
+children.put(ImportPhase.AFTER_PROFILE_ACTIVATION, updatedAfter);
+```
 
 ```
 classpath 这一组的内部（高 → 低）
@@ -1262,7 +2364,17 @@ java -Xmx512m -XX:+UseG1GC -Dfile.encoding=UTF-8 -Dserver.port=9090 -jar order-s
 
 ## 9.7 改 Nacos 为什么还能马上生效
 
-刷新换的是**这一格里的 Map**，不换这一格在表上的位置。`NacosContextRefresher` 收到服务端推送后更新快照并发布事件，Spring Cloud 再 rebind `@ConfigurationProperties`、重建 `@RefreshScope` 的 Bean（7.6）。下一次 `getProperty` 仍从第 1 行走到第 17 行，走到 Nacos 那一行时读到的是新内容。
+刷新换的是**这一格里的 Map**，不换这一格在表上的位置。整条调用链在 7.6。下一次 `getProperty` 仍从第 1 行走到第 17 行，走到 Nacos 那一行时读到的是新内容。
+
+拿第 13 行 `order-service.yaml,DEFAULT_GROUP` 里的 `order.create-qps-limit` 从 `200` 改成 `50` 走一遍：
+
+1. 握着这条 gRPC 连接的 Nacos 节点推来 `ConfigChangeNotifyRequest`，里面只有 `order-service.yaml`、`DEFAULT_GROUP` 和 namespace，没有 YAML 正文。客户端把该 `CacheData` 标成未对齐并摇铃，空响应返回。铃响后的 `ConfigBatchListenRequest` 带上本地旧 md5，服务端把这个 dataId 放进 `changedConfigs`。`queryConfigInner` 的 `ConfigQueryRequest` 才把含 `create-qps-limit: 50` 的全文写进 `CacheData`。md5 与监听器上次不同，于是 `receiveConfigInfo`。
+2. `NacosContextRefresher.innerReceive` 把这份全文放进快照，键是 `order-service.yaml@DEFAULT_GROUP`（本例 namespace 按 `public` 处理，键里不带 namespace），再发布 `NacosConfigRefreshEvent`。
+3. starter 把它译成 `RefreshEvent`。应用已经 Ready，`ConfigDataContextRefresher.refresh()` 重跑 ConfigData。
+4. 重放 import 时，`order-service.yaml` 这一份命中快照，不再向服务端要第二次。新的 `NacosPropertySource` 名字仍是 `order-service.yaml,DEFAULT_GROUP`。`replace` 把它放回第 13 行。`common.yaml` 和 `order-service-override.yaml` 这次没有快照，会再 `getConfig` 一次，名字不变，位置也不变。
+5. 第 1–12 行都没有 `order.create-qps-limit`。`getProperty` 走到第 13 行得到 `50`。`EnvironmentChangeEvent` 之后，绑定了这个键的 `@ConfigurationProperties` 重新初始化，字段变成 `50`。
+
+同一份文件里若把 `order.pay-timeout` 从 `30s` 改成 `10s`，第 1–4 步同样发生，第 13 行的 Map 里这个键也变成 `10s`。查找在第 1 行 `commandLineArgs` 的 `--order.pay-timeout=1s` 就返回了，业务侧仍是 `1s`。
 
 用本例的两个键看差别：
 
@@ -1303,4 +2415,9 @@ java -Xmx512m -XX:+UseG1GC -Dfile.encoding=UTF-8 -Dserver.port=9090 -jar order-s
 | dataId 不自动加 profile | `NacosConfigDataLocationResolver.java` 138–142、280–290 |
 | LOCAL / REMOTE | `NacosConfigDataLoader.java` 125–136；`ConfigPreference.java` 19–40 |
 | 刷新转 `RefreshEvent` | `NacosContextRefresher.java` 87–151；starter 内 `NacosConfigRefreshEventListener.java` 42–54 |
+| 推送不含正文，只含 dataId | Nacos 3.1.1 `ConfigChangeNotifyRequest.java` 28–73；`RpcConfigChangeNotifier.java` 87–125、194–196；`RpcPushService.java` 50–55 |
+| 客户端被叫醒后回源 | nacos-client 3.1.1 `ClientWorker.java` 746–781、864–927、1020–1035、1104–1138、1254–1262；`CacheData.java` 198–200、342–346、439–505 |
+| 快照一次消费 | `NacosSnapshotConfigManager.java` 49–88；`NacosConfigDataLoader.java` 166–173 |
+| 同名源原下标替换 | spring-cloud-commons 4.3.x `ConfigDataContextRefresher.java` 68–119；`MutablePropertySources.java` 171–175 |
+| 重新绑定与 `@RefreshScope` | `ConfigurationPropertiesRebinder.java` 125–171；`RefreshScope.java` 166–168；`RefreshEventListener.java` 65–73 |
 | 不要 bootstrap starter | `NacosConfigSpringCloudAutoConfiguration.java` 57–64 |
