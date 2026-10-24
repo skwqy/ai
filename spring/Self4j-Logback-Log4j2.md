@@ -61,20 +61,32 @@
 └────────────────────────────────────────────────────────────────┘
         │ 每个 Appender 各走一遍，彼此独立
         ▼
-┌─ 关 E  Appender 局部 Filter / AppenderRef 的 level ────────────┐
-│ 只决定"这个 Appender 写不写"，不影响兄弟 Appender              │
-│ Logback: 链的结果是 DENY 才不写；ACCEPT 与最终 NEUTRAL 都写    │
-│ Log4j2 : AppenderControl 与 Appender 上各自还有一道，见 2.3    │
+┌─ 关 E1 当前这个 Appender 自己的 Filter（仍在调用线程）─────────┐
+│ 只决定"这一个 Appender 写不写 / 入不入队"                      │
+│ Logback 文件与 Async 都走 UnsynchronizedAppenderBase.doAppend   │
+│ 链结果是 DENY 才停；ACCEPT 与最终 NEUTRAL 都进入 append()      │
+│ 挂在 AsyncAppender 上的 Filter 在这里执行，DENY 则根本不入队   │
+│ Log4j2 的 AppenderControl 与 Appender 各一道，见 2.2            │
+└────────────────────────────────────────────────────────────────┘
+        │ 同步文件：下一步就是关 G。异步：先入队
+        ▼
+┌─ 关 F  只有 AsyncAppender（调用线程）──────────────────────────┐
+│ 队列剩余容量 < discardingThreshold 且级别 ≤ INFO → 丢弃        │
+│ neverBlock=true 且队列满 → offer 失败，静默丢弃                │
+│ 否则 put 进 ArrayBlockingQueue。MDC/句子在入队前冻结           │
+└────────────────────────────────────────────────────────────────┘
+        │ worker 取出
+        ▼
+┌─ 关 E2 被包裹的那个 Appender 再走一遍 doAppend（worker 线程）──┐
+│ 它自己的 Filter 在这里才执行。DENY 则此事件已出队但不会写文件  │
 └────────────────────────────────────────────────────────────────┘
         │
         ▼
-┌─ 关 F  异步队列的丢弃（只在包了 AsyncAppender / AsyncLogger 时）┐
-└────────────────────────────────────────────────────────────────┘
-        │
-        ▼
-┌─ 关 G  滚动检查（不丢事件，只可能先换文件）→ 编码 → write ─────┐
+┌─ 关 G  滚动检查（不丢当前事件）→ 再次冻结懒字段 → encode → write ┐
 └────────────────────────────────────────────────────────────────┘
 ```
+
+上图关 F 按 Logback `AsyncAppender` 画：剩余容量低于阈值、并且级别 ≤ INFO，事件在入队前丢掉。Log4j2 的 `<Async>` 默认是队列满了阻塞，配成 `Discard` 之后才按级别丢。全异步 `AsyncLogger` 的 Logger 过滤器在出队之后。逐步判断在 2.2，两套引擎的对照在 2.3。
 
 ## 1.3 三值语义随挂载点变化
 
@@ -103,265 +115,764 @@
 
 # 二、写入文件前要过的关卡
 
-## 2.1 Logback：同步路径上的关
+## 2.1 Logback：一条日志从调用到字节，每一次可以死掉的判断
 
-以 `log.info("user {} login", uid)` 为例，入口是 `filterAndLog_1`。
-
-【源码证据】`logback-classic/.../classic/Logger.java` 第 392-407 行、第 427-432 行、第 256-268 行：
+下面按一次同时带 Marker 和 MDC 的调用写。配置是 root 上挂一个 `AsyncAppender`，它里面只包一个 `RollingFileAppender`。过滤器挂在哪一层，就在哪一层执行，不能提前，也不能补做。
 
 ```java
-final FilterReply decision = loggerContext.getTurboFilterChainDecision_1(...);
-if (decision == FilterReply.NEUTRAL) {
-    if (effectiveLevelInt > level.levelInt) {   // 关 B
-        return;
-    }
-} else if (decision == FilterReply.DENY) {      // 关 A
-    return;
-}
-// ACCEPT 直接落到下面
-buildLoggingEventAndAppend(...);                // 关：构造事件 + callAppenders
-```
+private static final Marker FLOW = MarkerFactory.getMarker("FLOW");
+private static final Marker BIZ = MarkerFactory.getMarker("BIZ");
 
-```java
-LoggingEvent le = new LoggingEvent(...);
-le.addMarker(marker);                           // 传统 API 只有一个 Marker
-callAppenders(le);                              // 沿 parent 向上，additive=false 则 break
-```
-
-关 A 的链本身在 `TurboFilterList.getTurboFilterChainDecision`（第 39-67 行）：按配置顺序走，**第一个** `DENY` 或 `ACCEPT` 立刻作为整链结果返回；全部 `NEUTRAL` 才得到 `NEUTRAL`。链为空时直接 `NEUTRAL`（第 44-46 行），等于没配全局 Filter。
-
-`isInfoEnabled(marker)` 走的是同一条 TurboFilter 链（第 575-586 行调用 `callTurboFilters`，第 762-764 行），但参数里的 format 是 `null`。所以"先 `isInfoEnabled()` 再拼接字符串"这套旧写法，看不到消息正文，只能看到 Marker、Logger、Level。直接 `log.info(marker, format, arg)` 时，TurboFilter 能看到 format 和参数数组，参数仍未格式化进句子。
-
-关 E 在 `AppenderBase.doAppend`（`logback-core/.../AppenderBase.java` 第 61-85 行）：
-
-```java
-if (!this.started) return;
-if (getFilterChainDecision(eventObject) == FilterReply.DENY) return;
-this.append(eventObject);
-```
-
-`FilterAttachableImpl.getFilterChainDecision`（第 51-65 行）同样是"第一个 DENY 或 ACCEPT 即返回"。`doAppend` **只把 DENY 当成不写**。因此：
-
-- 链返回 `ACCEPT`：后面的 Filter 不再执行，事件写入。
-- 链返回 `NEUTRAL`：事件同样写入。
-- 想"匹配才留、不匹配就丢"，必须显式写 `<OnMismatch>DENY</OnMismatch>`。`AbstractMatcherFilter` 的默认值两个都是 `NEUTRAL`（第 20-21 行），忘了配 `OnMismatch` 等于这个 Filter 不拦截任何人。
-
-关 G，`RollingFileAppender.subAppend`（第 205-223 行）先 `triggeringPolicy.isTriggeringEvent`，为真则 `rollover()`，然后 `super.subAppend`。滚动不丢弃当前事件。`OutputStreamAppender.subAppend`（第 248-257 行）调用 `prepareForDeferredProcessing()`，其中才会 `getFormattedMessage()` 并把 MDC 拷进事件（`LoggingEvent.java` 第 298-302 行），随后 `writeOut` → `encoder.encode` → `outputStream.write`（第 202-204 行、第 233-237 行）。
-
-**结论：Appender 上的 Filter 看到的是尚未格式化的事件；最终句子和 MDC 快照发生在 Filter 放行之后。** 过滤器若自己去调 `event.getFormattedMessage()` 或 `event.getMDCPropertyMap()`，才会提前触发这两份计算。
-
-### 2.1.1 用一段配置把关 A 和关 E 分开
-
-业务代码：
-
-```java
-private static final Logger log = LoggerFactory.getLogger(OrderService.class);
-private static final Marker AUDIT = MarkerFactory.getMarker("AUDIT");
-
-public void login(String userId) {
-    log.info("order flow {}", userId);             // 普通
-    log.info(AUDIT, "login user={}", userId);      // 带 AUDIT
-    log.debug(AUDIT, "login detail user={}", userId);
+MDC.put("traceId", "t-9");
+MDC.put("reqType", "biz");          // health 会在 TurboFilter 被整次丢掉
+try {
+    log.info(BIZ, "user {} login", uid);
+} finally {
+    MDC.clear();
 }
 ```
 
 ```xml
 <configuration>
+  <!-- 步 1：事件还不存在。先看 MDC，再看 Marker。第一个非 NEUTRAL 结束 -->
+  <turboFilter class="ch.qos.logback.classic.turbo.MDCFilter">
+    <MDCKey>reqType</MDCKey>
+    <Value>health</Value>
+    <OnMatch>DENY</OnMatch>
+    <OnMismatch>NEUTRAL</OnMismatch>
+  </turboFilter>
   <turboFilter class="ch.qos.logback.classic.turbo.MarkerFilter">
-    <Marker>AUDIT</Marker>
-    <OnMatch>ACCEPT</OnMatch>
+    <Marker>FLOW</Marker>
+    <OnMatch>DENY</OnMatch>
     <OnMismatch>NEUTRAL</OnMismatch>
   </turboFilter>
 
-  <appender name="APP" class="ch.qos.logback.core.FileAppender">
-    <file>logs/app.log</file>
-    <encoder><pattern>%level %msg%n</pattern></encoder>
-    <filter class="ch.qos.logback.classic.filter.ThresholdFilter">
-      <level>INFO</level>
-    </filter>
-    <filter class="ch.qos.logback.core.filter.EvaluatorFilter">
-      <evaluator class="ch.qos.logback.classic.boolex.OnMarkerEvaluator">
-        <marker>AUDIT</marker>
-      </evaluator>
-      <OnMatch>DENY</OnMatch>
-      <OnMismatch>NEUTRAL</OnMismatch>
-    </filter>
-  </appender>
+  <appender name="FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+  <file>logs/app.log</file>
+  <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
+    <fileNamePattern>logs/app.%d{yyyy-MM-dd}.log.gz</fileNamePattern>
+  </rollingPolicy>
+  <encoder><pattern>%d %-5level [%X{traceId}] %marker %msg%n</pattern></encoder>
+  <!-- 关 E2：worker 出队之后才执行。%X 读的是入队前拷进事件的 MDC -->
+  <filter class="ch.qos.logback.classic.filter.ThresholdFilter">
+    <level>INFO</level>
+  </filter>
+</appender>
 
-  <appender name="AUDIT_FILE" class="ch.qos.logback.core.FileAppender">
-    <file>logs/audit.log</file>
-    <encoder><pattern>%level %marker %msg%n</pattern></encoder>
-    <filter class="ch.qos.logback.core.filter.EvaluatorFilter">
-      <evaluator class="ch.qos.logback.classic.boolex.OnMarkerEvaluator">
-        <marker>AUDIT</marker>
-      </evaluator>
-      <OnMatch>ACCEPT</OnMatch>
-      <OnMismatch>DENY</OnMismatch>
-    </filter>
-  </appender>
+<appender name="ASYNC" class="ch.qos.logback.classic.AsyncAppender">
+  <queueSize>256</queueSize>
+  <discardingThreshold>51</discardingThreshold>
+  <neverBlock>false</neverBlock>
+  <!-- 关 E1：调用线程、入队之前执行 -->
+  <filter class="ch.qos.logback.classic.filter.LevelFilter">
+    <level>ERROR</level>
+    <onMatch>DENY</onMatch>
+    <onMismatch>NEUTRAL</onMismatch>
+  </filter>
+  <appender-ref ref="FILE"/>
+</appender>
 
-  <root level="INFO">
-    <appender-ref ref="APP"/>
-    <appender-ref ref="AUDIT_FILE"/>
-  </root>
+<root level="INFO">
+  <appender-ref ref="ASYNC"/>
+</root>
 </configuration>
 ```
 
-三条调用的落点：
+总顺序：
 
-| 调用 | 关 A TurboFilter | 关 B root=INFO | APP 的 Threshold + OnMarker | AUDIT_FILE 的 OnMarker | 磁盘 |
-|---|---|---|---|---|---|
-| `info("order flow")` | 无 Marker，`OnMismatch=NEUTRAL` | INFO 通过 | Threshold 对 INFO 返回 NEUTRAL；OnMarker 不匹配，NEUTRAL | 不匹配，DENY | 只在 `app.log` |
-| `info(AUDIT, "login")` | `contains("AUDIT")` 命中，ACCEPT，跳过级别门 | 被跳过 | Threshold 放行；OnMarker 匹配，DENY | 匹配，ACCEPT | 只在 `audit.log` |
-| `debug(AUDIT, "login detail")` | 同样 ACCEPT，DEBUG 也不被 root=INFO 拦住 | 被跳过 | Threshold：DEBUG 比 INFO 低，**DENY** | 匹配，ACCEPT | 只在 `audit.log` |
+| 步 | 线程 | 做什么 | 这一步会死的条件 |
+|---|---|---|---|
+| 1 | 调用线程 | TurboFilter 链。本例先 `MDCFilter`（读此刻的 `MDC.get`），再 `MarkerFilter`（读这次调用带上的那一个 Marker） | 第一个非 NEUTRAL 是 DENY。还没有 `LoggingEvent` |
+| 2 | 调用线程 | 级别门 `effectiveLevelInt > level.levelInt` | 第 1 步是 NEUTRAL 且这个不等式成立。ACCEPT 跳过本步 |
+| 3 | 调用线程 | `new LoggingEvent` | 不再做过滤。异常栈代理、时间戳在这里生成；句子和 MDC 还不生成 |
+| 4 | 调用线程 | 沿父 Logger 找 Appender | 一个 Appender 都没调用到时，只打一条 status 警告，没有字节 |
+| 5 | 调用线程 | `ASYNC.doAppend`：未启动、然后是它自己的 Filter 链 | 未启动，或链结果为 DENY。本例 ERROR 在这里被拒，不入队 |
+| 6 | 调用线程 | 丢弃判断，然后 `preprocess`，然后入队 | 队列快满且级别 ≤ INFO；或 `neverBlock=true` 时队列满 |
+| 7 | worker | `FILE.doAppend`：再走一遍未启动 + Filter 链 | FILE 未启动，或 `ThresholdFilter` 返回 DENY |
+| 8 | worker | 滚动、冻结懒字段、`encoder.encode`、`write` | 流已停、编码结果是空数组、或写的时候 IOException |
 
-第三条就是"全局 ACCEPT 不等于每个文件都写"。DEBUG 审计事件已经诞生，APP 的局部 `ThresholdFilter` 仍能把它拒掉。
+同步文件没有第 6、7 步的分离：`FILE` 直接挂在 root 上时，第 5 步就是 FILE 的 `doAppend`，Filter 在调用线程执行，通过后立刻进入第 8 步。
 
-`ThresholdFilter.decide`（第 39-48 行）：事件级别 `isGreaterOrEqual(配置级别)` 时返回 `NEUTRAL`，否则 `DENY`。它从不返回 `ACCEPT`，所以它挡得住"太啰嗦"的事件，挡不住后面的 Filter，也替代不了 Logger 的级别门。
+### 2.1.1 入口有两条，级别门只在传统 API 上和 TurboFilter 绑在一起
 
-## 2.2 Log4j2：同步路径上的关
+`Logger.info(String, Object)` 进入 `filterAndLog_1`。零参数和三个及以上参数走 `filterAndLog_0_Or3Plus`，两个参数走 `filterAndLog_2`。三份代码的判断相同，差别只是传给 TurboFilter 的参数数组：一个参数时在 `LoggerContext.getTurboFilterChainDecision_1`（第 264-269 行）里先 `new Object[]{ param }`，然后才调用过滤器。所以一次单参数的 `log.info` 即使马上被 DENY，也已经分配了这个长度为 1 的数组。
 
-【源码证据】调用先过 `AbstractLogger.logIfEnabled`（`log4j-api/.../AbstractLogger.java` 第 2330-2338 行）：`isEnabled` 为 false 就不再 `logMessage`。`isEnabled` 进入 `PrivateConfig.filter`（`log4j-core/.../core/Logger.java` 第 532-540 行）：
+【源码证据】`classic/Logger.java` 第 392-407 行：
 
 ```java
-boolean filter(final Level level, final Marker marker, final String msg) {
-    final Filter filter = config.getFilter();          // 关 A：Configuration 级，不是 Logger 级
-    if (filter != null) {
-        final Filter.Result r = filter.filter(logger, level, marker, msg);
-        if (r != Filter.Result.NEUTRAL) {
-            return r == Filter.Result.ACCEPT;          // ACCEPT→true，DENY→false
+final FilterReply decision = loggerContext.getTurboFilterChainDecision_1(marker, this, level, msg, param, t);
+if (decision == FilterReply.NEUTRAL) {
+    if (effectiveLevelInt > level.levelInt) {
+        return;                         // 死在级别门，没有 LoggingEvent
+    }
+} else if (decision == FilterReply.DENY) {
+    return;                             // 死在 TurboFilter，没有 LoggingEvent
+}
+// decision == ACCEPT：两个 if 都不进，直接构造事件
+buildLoggingEventAndAppend(localFQCN, marker, level, msg, new Object[] { param }, t);
+```
+
+`FilterReply` 只有 `DENY`、`NEUTRAL`、`ACCEPT` 三个枚举值（`FilterReply.java` 第 28-29 行）。传统 API 里没有第四种分支。
+
+Fluent API 是另一条入口，`Logger.log(LoggingEvent)`（第 817-826 行）只认 DENY：
+
+```java
+final FilterReply decision = loggerContext.getTurboFilterChainDecision(this, slf4jEvent);
+// ACCEPT 和 NEUTRAL 都往下走，这里不再做级别比较
+if (decision == FilterReply.DENY) {
+    return;
+}
+```
+
+级别比较发生在更早的 `atInfo()` / `atDebug()`。SLF4J 的默认方法先问 `isEnabledForLevel`，没启用就返回 NOP 构建器，后面的 `addMarker().log()` 不会进到 Logback。`isInfoEnabled(Marker)`（第 575-586 行）走的也是 TurboFilter，但 `callTurboFilters`（第 762-764 行）把 format 和参数都传成 `null`。因此：
+
+- `log.info(marker, format, arg)`：TurboFilter 看得到 format 和参数数组，整条链路只经过 **一次** TurboFilter。
+- `log.atInfo().log(format, arg)`：`atInfo()` 里一次（format 还是 null），`log(LoggingEvent)` 里再一次（这次才有 format）。`DuplicateMessageFilter` 这种有计数的过滤器会被加两次。第二次若变成 DENY，事件在诞生前死掉；第二次若是 NEUTRAL，不再回头看级别。
+
+`log.info` 本身不会先调用 `isInfoEnabled()`。业务代码里手写的 `if (log.isInfoEnabled())` 是额外一次 TurboFilter，不是框架内部的关卡。
+
+### 2.1.2 TurboFilter 链：按配置顺序，第一个 DENY 或 ACCEPT 结束全链
+
+`LoggerContext` 在进链之前先看列表长度（第 256-260 行）。长度为 0 直接返回 `NEUTRAL`，热路径上没有 TurboFilter 时就这一次判断。
+
+长度不为 0 才进入 `TurboFilterList.getTurboFilterChainDecision`（第 39-67 行）：
+
+1. 长度仍是 0（并发清空）：返回 `NEUTRAL`。
+2. 长度是 1：调用这一个 `decide`。若取元素时抛 `IndexOutOfBoundsException`（并发删掉了它），返回 `NEUTRAL`，这次调用当成没配过滤器。
+3. 长度大于 1：按列表顺序调用。返回值是 `DENY` 或 `ACCEPT` 时立刻作为整链结果，后面的 TurboFilter 不再执行。返回 `NEUTRAL` 才问下一个。全部是 `NEUTRAL` 时整链才是 `NEUTRAL`。
+
+列表是 `CopyOnWriteArrayList`，`<turboFilter>` 的书写顺序就是执行顺序，`addTurboFilter` 加在尾部（`LoggerContext.java` 第 241-242 行）。
+
+每个 `decide` 拿到的是：这一个 Marker、当前 Logger、这次调用的 Level、**还没格式化的** format 字符串、参数数组、Throwable。没有 `LoggingEvent`，所以这里读不到 `getFormattedMessage()`，也读不到事件上的 MDC 快照。`MDCFilter` 读的是调用线程上此刻的 `MDC.get`（`MDCFilter.java` 第 71 行）。
+
+Fluent 那次重载 `TurboFilter.decide(Logger, LoggingEvent)`（第 92-101 行）默认只把 marker 列表的 **第一个** 传给上面的 `decide(Marker, ...)`。`MarkerFilter` 没有覆盖这个重载，多个 Marker 时全局只看见第一个。
+
+未 `start` 的 TurboFilter 自己返回 `NEUTRAL`（`MarkerFilter` 第 42-44 行，`MDCFilter` 第 66-68 行），相当于从链上消失，不会误伤。`MatchingFilter` 的 `onMatch` 和 `onMismatch` 默认都是 `NEUTRAL`（第 26-27 行）。XML 里的字符串只有 `"NEUTRAL"`、`"ACCEPT"`、`"DENY"` 三种会被认出来（第 29-36 行），写错单词则保持默认 NEUTRAL。
+
+链结果回到 `filterAndLog_1` 之后只有三种效果：
+
+| 链结果 | 级别门 | 事件 |
+|---|---|---|
+| `DENY` | 不看 | 不创建 |
+| `NEUTRAL` | `effectiveLevelInt > 本次 levelInt` 则死 | 级别通过才创建 |
+| `ACCEPT` | 不看 | 立刻创建。root 是 INFO 时，DEBUG 也会创建 |
+
+`ACCEPT` 只跳过级别门。后面的 Appender Filter、队列丢弃、文件阈值都还在。
+
+### 2.1.3 级别门：比的是已经推好的 effectiveLevelInt
+
+`effectiveLevelInt` 是这个 Logger 当前生效级别的整数，读的时候不再向上找父节点。root 重置后的默认值是 `DEBUG` 的 10000（`localLevelReset`，第 323-326 行）。子 Logger 的 `level == null` 表示继承，父级 `setLevel` 时通过 `handleParentLevelChange`（第 185-189 行）把整数推下来；子节点自己有级别时不跟随。
+
+比较式是 `effectiveLevelInt > level.levelInt` 就拒绝（第 399-401 行）。Logback 的整数越大越严重（`Level.java` 第 31-36 行）：
+
+| 级别 | 整数 |
+|---|---|
+| TRACE | 5000 |
+| DEBUG | 10000 |
+| INFO | 20000 |
+| WARN | 30000 |
+| ERROR | 40000 |
+
+root 为 INFO（20000）时：
+
+- `log.debug` 的 levelInt 是 10000，`20000 > 10000`，返回。没有事件。
+- `log.info` 的 levelInt 是 20000，`20000 > 20000` 为假，继续。
+- `log.error` 的 levelInt 是 40000，继续。
+
+`Level.isGreaterOrEqual`（第 161-162 行）是 `levelInt >= 对方`，和这道门的 `>` 方向相反，Appender 上的 `ThresholdFilter` 用的是前者。两处不要混成同一个比较。
+
+这一步结束之前，占位符还是 format 加参数数组，没有拼成最终句子。
+
+### 2.1.4 事件诞生：构造函数做完的事，和故意留到后面的事
+
+级别门通过（或 TurboFilter 为 ACCEPT）之后才执行 `buildLoggingEventAndAppend`（第 427-431 行）：
+
+```java
+LoggingEvent le = new LoggingEvent(localFQCN, this, level, msg, t, params);
+le.addMarker(marker);
+callAppenders(le);
+```
+
+构造函数（`LoggingEvent.java` 第 120-150 行）写入：
+
+- 调用边界类名 `fqnOfLoggerClass`、logger 名字、LoggerContext、这次的 Level。
+- 原始 `message` 和 `argumentArray`。`formattedMessage` 保持 null。
+- `Clock.systemUTC().instant()` 拆成毫秒时间戳和纳秒。
+- 若上下文配了 `SequenceNumberGenerator`，取下一个序号。
+- `throwable` 参数为 null 时，从参数数组末尾抽出 Throwable，并把它从参数数组里裁掉（第 140-142 行、第 161-166 行）。所以 Appender Filter 里看到的 `getThrowableProxy()` 已经就绪，最后一个参数是异常时它不占 `{}`。
+- 有异常就建 `ThrowableProxy`。`packagingData` 打开时，这里就计算每个栈帧所属的 jar。这是构造事件时最贵的一步，发生在任何 Appender Filter 之前。
+
+构造函数 **不** 做的事：
+
+- 不调用 `MessageFormatter`，最终句子还不存在。
+- 不拷贝 MDC。`mdcPropertyMap` 仍是 null。
+- 不取调用栈。`callerDataArray` 仍是 null。
+- 传统 API 的 Marker 是构造之后 `addMarker` 放进去的（第 419-426 行）。传入 null 时 `addMarker` 直接返回，列表保持 null。
+
+Fluent 入口在 DENY 检查之后做同样的构造，再把 marker 列表里的每一个都 `addMarker`，并 `setKeyValuePairs`（第 837-845 行）。注释写明：到了 `callAppenders`，TurboFilter 已经没有机会再插手。
+
+### 2.1.5 沿父链把同一个事件交给每个 Appender
+
+`callAppenders`（第 256-268 行）：
+
+```java
+int writes = 0;
+for (Logger l = this; l != null; l = l.parent) {
+    writes += l.appendLoopOnAppenders(event);
+    if (!l.additive) {
+        break;
+    }
+}
+if (writes == 0) {
+    loggerContext.noAppenderDefinedWarning(this);
+}
+```
+
+从当前 Logger 走到 root。某一级 `additive == false` 时，这一级的 Appender 仍然会收到事件，它的父级不再收到。`appendLoopOnAppenders`（`AppenderAttachableImpl.java` 第 46-54 行）把当前挂载的 Appender 数组拍一份快照，逐个 `doAppend`，每调用一次计数加一。返回值是"调用了几次 doAppend"，不是"写成功了几个字节"。某个 Appender 内部把事件丢掉，计数仍然增加，因此 `writes == 0` 只表示整条父链上没有挂 Appender。这时打一条 status 警告，事件对象成为垃圾，磁盘上没有这行。
+
+父 Logger **不会**再跑 TurboFilter，也 **不会**再比级别。事件已经诞生。父级 Appender 上的 Filter 仍会在各自的 `doAppend` 里执行。同一个事件可以进子 Logger 的异步队列，同时又被 root 上的同步 Console 写出去。`additive=true` 且父子都引用了同一个 AsyncAppender 时，这个事件会入队两次。
+
+兄弟 Appender 互不影响。APP 的 Filter 返回 DENY，只结束 APP 的 `doAppend`；循环里的下一个 Appender 照常开始自己的 `doAppend`。
+
+### 2.1.6 doAppend：1.5 的文件和异步都走 UnsynchronizedAppenderBase
+
+`FileAppender`、`RollingFileAppender`、`ConsoleAppender`、`AsyncAppender` 的 `doAppend` 都来自 `UnsynchronizedAppenderBase`（`OutputStreamAppender` 第 37 行继承它，`AsyncAppenderBase` 第 46 行继承它）。`AppenderBase.doAppend` 仍在，但是同步骨架，给仍继承它的自定义 Appender 用。库存的文件路径不经过它。
+
+`UnsynchronizedAppenderBase.doAppend`（第 60-91 行）的顺序是固定的：
+
+```java
+public void doAppend(E eventObject) {
+    if (!this.started) {                 // ① 未启动：警告后返回，事件在这个 Appender 上死
+        ...
+        return;
+    }
+    if (reentryGuard.isLocked()) {       // ② 重入
+        return;
+    }
+    try {
+        reentryGuard.lock();
+        if (getFilterChainDecision(eventObject) == FilterReply.DENY) {  // ③ 只有 DENY
+            return;
         }
-    }
-    return level != null && intLevel >= level.intLevel(); // 关 B
-}
-```
-
-这里的 `config.getFilter()` 是挂在 `<Configuration>` 下的 Filter。多个 Filter 会被收成 `CompositeFilter`：第一个 `ACCEPT` 或 `DENY` 作为整链结果（`CompositeFilter.java` 第 179-188 行）。
-
-通过之后才创建 `LogEvent`，再进入 `LoggerConfig.log`（第 728-742 行 → 第 739-742 行）：
-
-```java
-protected void log(final LogEvent event, final LoggerConfigPredicate predicate) {
-    if (!isFiltered(event)) {          // 关 C
-        processLogEvent(event, predicate);
+        this.append(eventObject);        // ④ 子类的 append
+    } catch (Exception e) {
+        // 异常被吃掉，这一次没有重试
+    } finally {
+        reentryGuard.unlock();
     }
 }
 ```
 
-`AbstractFilterable.isFiltered`（第 152-153 行）只有 `filter.filter(event) == DENY` 才算被过滤。`ACCEPT` 与 `NEUTRAL` 都算没被过滤。`processLogEvent`（第 762-768 行）先 `callAppenders`，再 `logParent`（第 796-800 行）。父节点走的是 `parent.log(event)`，会**再执行父节点自己的** `isFiltered`。子节点一旦 DENY，`logParent` 根本不会被调用，root 上的审计 Appender 也收不到。这是 Log4j2 才有的一关，Logback 的 Logger 上挂不住 Filter。
+① 未 `start`：用时间间隔限制警告次数，然后返回。配置写错、`start()` 因缺少 encoder 失败、或者写文件时 IOException 把 `started` 打成 false 之后，后续事件都死在这里。
 
-关 E 拆成三道，全在 `AppenderControl`（第 84-104 行、第 130-156 行）：
+② 重入守卫在 `start()` 里由 `buildReentryGuard()` 创建（第 102-103 行）。默认是 `GuardType.NOP`（第 130-131 行），`NOPRentryGuard.isLocked()` 永远返回 false（`ReentryGuard.java` 第 122-123 行）。所以 **FileAppender、RollingFileAppender、AsyncAppender 不会因为重入把事件丢掉**。`ConsoleAppender` 改成了 `THREAD_LOCAL`（第 109-110 行）：同一线程在 `doAppend` 里再次进入这个 Console（例如 Pattern 的转换器里又打了日志，或者编码时触发了日志），第二次在 ② 返回，防止递归把栈打满。
+
+③ 见下一节。④ 对异步是入队，对文件是滚动并写字节。`append()` 抛出的异常被  catch 吃掉，事件不会交给下一个重试。
+
+### 2.1.7 Appender 的 Filter 链：和 TurboFilter 同一套三值，死亡条件更窄
+
+`getFilterChainDecision` 在 `FilterAttachableImpl`（第 51-65 行）：
 
 ```java
-public void callAppender(final LogEvent event) {
-    if (shouldSkip(event)) return;    // 下面三选一即跳过
-    ...
+for (int i = 0; i < len; i++) {
+    final FilterReply r = filterArrray[i].decide(event);
+    if (r == FilterReply.DENY || r == FilterReply.ACCEPT) {
+        return r;          // 第一个非 NEUTRAL 结束整链
+    }
 }
-private boolean shouldSkip(final LogEvent event) {
-    return isFilteredByAppenderControl(event)   // ① AppenderRef 上嵌套的 Filter，仅 DENY 跳过
-        || isFilteredByLevel(event)             // ② <AppenderRef level="...">
-        || isRecursiveCall();
-}
-// ② 的判定：ref 的 intLevel < 事件.intLevel 则跳过
-//    例：ref level=ERROR(200)，事件 INFO(400)，200<400，跳过
-private boolean isFilteredByAppender(final LogEvent event) {
-    return appender instanceof Filterable && ((Filterable) appender).isFiltered(event);
-    // ③ Appender 元素内部的 Filter，同样只有 DENY 才跳过
+return FilterReply.NEUTRAL;
+```
+
+`doAppend` 只判断 `== DENY`。于是：
+
+| 链的最终返回值 | 后面的 Filter | `append()` |
+|---|---|---|
+| `DENY` | 不再执行 | 不调用。这个 Appender 上事件死 |
+| `ACCEPT` | 不再执行 | 调用 |
+| `NEUTRAL`（每个都是 NEUTRAL，或链是空的） | 已经走完 | **仍然调用** |
+
+空 Filter 链得到 `NEUTRAL`，事件会写。这是和 TurboFilter 的关键差别：TurboFilter 的 `NEUTRAL` 还要过级别门，Appender 的 `NEUTRAL` 就是放行。`Filter.decide` 的注释（`Filter.java` 第 51-56 行）说 ACCEPT 表示不再咨询链上其他过滤器并记录这条事件，说的就是这个短路。
+
+三个内置 Filter 的 `decide` 本身：
+
+`ThresholdFilter`（第 39-48 行）。未启动返回 `NEUTRAL`（不拦截）。已启动时 `event.getLevel().isGreaterOrEqual(配置级别)` 为真返回 `NEUTRAL`，否则返回 `DENY`。它从不返回 `ACCEPT`，所以挡得住低于阈值的事件，但挡不住排在它后面的 Filter。配置 `<level>INFO</level>` 时：INFO/WARN/ERROR 得到 NEUTRAL 并继续；DEBUG/TRACE 得到 DENY，`doAppend` 返回。
+
+`LevelFilter`（第 36-46 行）。未启动返回 `NEUTRAL`。已启动且 `event.getLevel().equals(配置级别)` 返回 `onMatch`，否则 `onMismatch`。`AbstractMatcherFilter` 两个默认都是 `NEUTRAL`（第 20-21 行）。本例把 ERROR 配成 `onMatch=DENY`、`onMismatch=NEUTRAL`：只有 ERROR 死在 ASYNC 上，其他级别继续去入队。若忘了写 `OnMismatch`，不匹配也是 NEUTRAL，这个 Filter 谁也不挡。
+
+`EvaluatorFilter`（第 60-75 行）。自己或里面的 evaluator 没启动，返回 `NEUTRAL`。`evaluate` 为真返回 `onMatch`，为假返回 `onMismatch`。评估抛 `EvaluationException` 时记一条错误并返回 `NEUTRAL`，评估器写错不会把日志全部丢掉。`OnMarkerEvaluator` 对事件上的每个 Marker 做 `contains(配置名)`，有一个为真即命中（第 43-58 行）。事件还没有 Marker 列表时返回 false，走 `onMismatch`。
+
+这些 `decide` 拿到的是已经构造好的 `ILoggingEvent`。在调用线程上、且还没人调用过 `prepareForDeferredProcessing` 时，`getFormattedMessage()` 仍是懒的，`getMDCPropertyMap()` 一调用就会从 **当前线程** 拷贝 MDC（第 453-461 行）。同步文件的 Filter 跑在调用线程上，这时 `MDC.get` 和 `getMDCPropertyMap()` 看到的是同一份。异步包裹内的 FILE 上的 Filter 跑在 worker 上，见 2.1.9。
+
+### 2.1.8 入队：ASYNC 自己的 Filter 已经通过之后
+
+`AsyncAppender.append` 继承 `AsyncAppenderBase.append`（第 161-167 行），只有 `doAppend` 的第 ③ 步不是 DENY 才会进来：
+
+```java
+protected void append(E eventObject) {
+    if (isQueueBelowDiscardingThreshold() && isDiscardable(eventObject)) {
+        return;                    // 死：不入队
+    }
+    preprocess(eventObject);       // 冻结句子、线程名、MDC
+    put(eventObject);
 }
 ```
 
-① 和 ③ 是两套 Filter，都会生效。`<AppenderRef>` 里的 Filter 先看，`<RollingFile>` 里面的 Filter 后看。
+丢弃条件两个都必须成立。
 
-关 G：`RollingFileAppender.append`（第 479-481 行）先 `checkRollover(event)`，再 `super.append` → `layout.encode` 写入（`AbstractOutputStreamAppender.java` 第 209-230 行）。滚动不丢事件。
+`isQueueBelowDiscardingThreshold`（第 169-171 行）是 `blockingQueue.remainingCapacity() < discardingThreshold`。`start()` 里若没配置 `discardingThreshold`，把它设成 `queueSize / 5`（第 111-112 行）。默认 `queueSize` 是 256（第 54-55 行），阈值就是 51。`ArrayBlockingQueue` 的剩余容量小于 51，表示已经放进了超过 `256 - 51 = 205` 个事件，大约超过 80%。队列还很空时，这个条件为假，TRACE 也会入队。
 
-`AbstractFilter` 的默认动作和 Logback 相反，配的时候要分开记（第 109-110 行）：
+`isDiscardable` 在 classic 的 `AsyncAppender`（第 39-41 行）里是 `level.toInt() <= INFO_INT`，也就是 TRACE、DEBUG、INFO。WARN（30000）和 ERROR（40000）永远不是可丢的。基类默认 `isDiscardable` 返回 false（第 84-86 行），不换成 classic 子类就不会按级别丢。
 
-- `onMatch` 省略 → `NEUTRAL`
-- `onMismatch` 省略 → `DENY`
+两个条件都成立时方法直接返回。事件不进队列，worker 永远看不到它，FILE 上的 `ThresholdFilter` 也不会为它执行。本例 root 是 INFO，能诞生的最低就是 INFO，所以队列一过线，业务 INFO 会被丢掉，ERROR 会留下。这是排障时把 DEBUG 放进默认 AsyncAppender 之后"有时有、有时没有"的原因：DEBUG 的整数更小，同样算可丢。
 
-一个只写了 `<MarkerFilter marker="AUDIT"/>`、没写 onMatch/onMismatch 的全局过滤器，会把**所有不带 AUDIT 的日志 DENY 掉**。Logback 同位置忘配时两个默认都是 NEUTRAL，表现为"这个过滤器没起作用"。
-
-### 2.2.1 与 2.1.1 同一业务的 Log4j2 配置
-
-下面这份按 **Log4j2 原生 Marker** 来写：`PAYMENT.setParents(AUDIT)` 之后，打出 `PAYMENT` 也会被 `marker="AUDIT"` 命中。SLF4J `add()` 的方向见第三章，不要把两套 API 混在同一棵树上。
+通过丢弃判断后才 `preprocess`（classic 第 44-47 行）：
 
 ```java
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
-import org.apache.logging.log4j.Marker;
-import org.apache.logging.log4j.MarkerManager;
+eventObject.prepareForDeferredProcessing();   // 格式化句子、线程名、MDC 快照
+if (includeCallerData)
+    eventObject.getCallerData();
+```
 
-private static final Logger log = LogManager.getLogger(OrderService.class);
+`prepareForDeferredProcessing`（`LoggingEvent.java` 第 298-302 行）依次调用 `getFormattedMessage()`、`getThreadName()`、`getMDCPropertyMap()`。这一刻才把 `{}` 换成参数，把调用线程的 MDC 放进事件。之后业务线程即使 `MDC.remove`，队列里的事件仍带着刚才的 map。`includeCallerData` 默认 false，不取栈；设成 true 则在 **调用线程** 上取栈，再入队。
+
+然后 `put`（第 173-178 行）：
+
+- `neverBlock == false`（默认）：`putUninterruptibly`（第 181-196 行）循环 `blockingQueue.put`。队列满时 **调用线程阻塞**，直到 worker 取走一些。中断不会把事件丢掉，只是记下中断、继续 put，最后把中断标记补回当前线程。
+- `neverBlock == true`：`offer`。队列满时 `offer` 返回 false，返回值被忽略，事件静默消失，调用线程不阻塞。
+
+`AsyncAppender` 只能挂一个下游 Appender。第二个 `addAppender` 被忽略并记警告（第 253-261 行），那个下游不会收到任何事件。`start()` 时一个都没挂，Appender 根本不启动（第 101-103 行），之后所有 `doAppend` 死在未启动。
+
+### 2.1.9 出队：worker 上再做一次完整的 doAppend
+
+`Worker.run`（第 288-318 行）是守护线程，名字 `AsyncAppender-Worker-` 加 Appender 名。
+
+```java
+while (parent.isStarted()) {
+    E e0 = parent.blockingQueue.take();     // 队列空则阻塞，事件活在队列里
+    elements.add(e0);
+    parent.blockingQueue.drainTo(elements); // 把当前已经在队列里的其余事件一次取出
+    for (E e : elements) {
+        aai.appendLoopOnAppenders(e);       // 被包裹 Appender 的 doAppend
+    }
+}
+```
+
+`take` 只在队列空时阻塞。`drainTo` 把取出第一个之后、此刻已经在队列中的事件一并拿走，减少反复唤醒。每一个都调用下游的 `appendLoopOnAppenders`，也就是 FILE 的 `doAppend`。FILE 在这里才跑自己的 Filter 链（本例的 `ThresholdFilter`）、才进入 `append()`。
+
+worker 被 `interrupt` 后 `take`/`drainTo` 抛 `InterruptedException`，循环结束。然后把队列里还剩下的事件再交给下游（第 312-315 行），最后 `detachAndStopAllAppenders()`。`stop()` 里 `join(maxFlushTime)`，默认最多等 1000 毫秒（第 70-71 行、第 142 行）。超时线程还活着时，队列里剩下的事件可能被丢弃，status 里会写剩余个数（第 145-147 行）。
+
+FILE 的 Filter 此时在 worker 线程执行：
+
+- `event.getMDCPropertyMap()` 返回入队前冻结的那份，traceId 还在。
+- `MDC.get("traceId")` 读的是 worker 的 ThreadLocal，通常是空的。写在 FILE 上的自定义 Filter 若调用 `MDC.get`，会把已经入队的事件误判成"没有 traceId"。
+- `getFormattedMessage()` 返回入队前已经算好的句子，不会用 worker 上后来的参数再格式化一次。
+
+同步把 FILE 直接挂到 root 时没有 worker。Filter 在调用线程的 `doAppend` 里执行，通过后立刻 `append()`。那时 `prepareForDeferredProcessing` 还没被调用，它发生在 `subAppend` 的写之前。所以同步 Filter 看到的是未格式化的事件，除非 Filter 自己调用了 `getFormattedMessage()` 或 `getMDCPropertyMap()`。
+
+### 2.1.10 写字节：滚动不丢事件，空编码和 IO 错误会让这一次没有字节
+
+FILE 的 `doAppend` 通过 Filter 之后调用 `OutputStreamAppender.append`（第 106-111 行）。这里再看一次 `isStarted()`，停机竞态下直接返回。然后 `RollingFileAppender.subAppend`（第 205-223 行）：
+
+```java
+triggeringPolicyLock.lock();
+try {
+    if (triggeringPolicy.isTriggeringEvent(currentlyActiveFile, event)) {
+        rollover();                 // 换文件，当前事件不丢
+    }
+} finally {
+    triggeringPolicyLock.unlock();
+}
+super.subAppend(event);
+```
+
+`OutputStreamAppender.subAppend`（第 248-264 行）：
+
+```java
+if (!isStarted()) return;
+if (event instanceof DeferredProcessingAware) {
+    event.prepareForDeferredProcessing();   // 同步路径第一次冻结；异步路径多数字段已经填过
+}
+writeOut(event);
+```
+
+`writeOut`（第 202-204 行）是 `encoder.encode(event)` 得到 `byte[]`，再 `writeBytes`。`writeBytes`（第 207-220 行）：数组为 null 或长度为 0 则返回，磁盘上没有新增字节，也不报错。非空时拿 `streamWriteLock`，锁内再看 `isStarted()`，为真才 `outputStream.write`，并且 `immediateFlush` 为真时 `flush`（第 233-237 行）。编码在锁外面，写在锁里面。
+
+`IOException` 时 `subAppend` 把 `started` 设为 false 并记一条 ErrorStatus（第 259-263 行）。这次的字节没有落盘。此后这个 Appender 的 `doAppend` 在 ① 就返回，直到有人重新 start。
+
+### 2.1.11 把本例的调用走完
+
+root=INFO。步 1 的两个 TurboFilter 按书写顺序执行：`reqType=health` 整次 DENY；`FLOW` 整次 DENY；其余 NEUTRAL，交给级别门。ASYNC 上的 LevelFilter 拒绝 ERROR，FILE 上的 ThresholdFilter 拒绝低于 INFO 的事件。队列未满。调用前线程上是 `traceId=t-9`、`reqType=biz`，除非某一行另写。
+
+| 调用 | MDC | Marker | 步 1 | 步 2 级别门 | 步 5 ASYNC 的 LevelFilter | 步 6 入队 | 步 7 FILE 的 Threshold | 磁盘 |
+|---|---|---|---|---|---|---|---|---|
+| `info(BIZ, "user {} login", uid)` | `reqType=health`，`traceId=t-9` | BIZ | **MDCFilter DENY**。MarkerFilter 不再执行 | 不到 | 不到 | 不到 | 不到 | 无。没有 LoggingEvent。`traceId` 也救不了这一次 |
+| `info(FLOW, "user {} login", uid)` | `reqType=biz`，`traceId=t-9` | FLOW | MDCFilter NEUTRAL，**MarkerFilter DENY** | 不到 | 不到 | 不到 | 不到 | 无。没有 LoggingEvent |
+| `debug(BIZ, "user {} login", uid)` | `reqType=biz`，`traceId=t-9` | BIZ | 两道都 NEUTRAL。BIZ 不含 FLOW | 20000 > 10000，死 | 不到 | 不到 | 不到 | 无。没有 LoggingEvent |
+| `info(BIZ, "user {} login", uid)` | `reqType=biz`，`traceId=t-9` | BIZ | 两道都 NEUTRAL | 20000 > 20000 为假 | 不是 ERROR，NEUTRAL，进入 append | 队列空，INFO 也入队。入队前格式化，并把 `traceId=t-9` 拷进事件 | INFO ≥ INFO，NEUTRAL，写 | `app.log` 有 `[t-9] BIZ user … login`。worker 上 `MDC.get("traceId")` 是空的，`%X` 用的是事件里那份 |
+| `info("user {} login", uid)` | `reqType=biz`，`traceId=t-9` | 无 | Marker 为 null，走 onMismatch，NEUTRAL | 通过 | NEUTRAL，入队 | 同上一行 | 写 | `app.log` 有 `[t-9]`，marker 那一格是空的 |
+| `error(BIZ, "user {} login", uid)` | `reqType=biz`，`traceId=t-9` | BIZ | NEUTRAL | 通过 | **DENY**，`doAppend` 返回 | 不入队 | 不到 | 无。事件已诞生，死在包裹层。MDC 和 Marker 都没能让 ERROR 入队 |
+| `info(BIZ, ...)` 且队列已超过约 80% | `reqType=biz` | BIZ | NEUTRAL | 通过 | NEUTRAL | `remainingCapacity < 51` 且 INFO 可丢，**不入队** | 不到 | 无。同样水位下的 ERROR 会入队，但本例 ERROR 在步 5 已经死了 |
+
+`log.info` 返回之后业务线程立刻 `MDC.clear()`，不影响已经入队的那条：`preprocess` 在 `put` 之前把 map 拷走了。
+
+再把 FILE 直接挂到 root、去掉 ASYNC：`error(BIZ, ...)` 不再被 LevelFilter 拒绝，FILE 的 Threshold 对 ERROR 返回 NEUTRAL，调用线程里格式化并写入，`%X{traceId}` 仍是调用线程上的 `t-9`。`debug(BIZ, ...)` 仍然死在步 2。
+
+把 MarkerFilter 的 `OnMatch` 改成 `ACCEPT`、`OnMismatch` 仍是 `NEUTRAL` 时，`debug(FLOW, ...)` 在 `reqType=biz` 下会跳过步 2，创建事件并进入步 5。ASYNC 的 LevelFilter 不拒绝 DEBUG，于是入队；FILE 的 Threshold 对 DEBUG 返回 DENY，worker 把已出队的事件丢掉，文件里仍然没有。全局 ACCEPT 只改步 2。步 7 仍按 FILE 自己的 Filter 执行。`reqType=health` 时 MDCFilter 排在前面，FLOW 的 ACCEPT 不会被执行。
+
+### 2.1.12 死亡点清单
+
+1. TurboFilter 链第一个非 NEUTRAL 是 DENY。无事件。
+2. 链是 NEUTRAL（或没配 TurboFilter），且 `effectiveLevelInt > 本次 levelInt`。无事件。Fluent 的这条死在 `atXxx()` 返回 NOP 构建器，而不是死在 `log(LoggingEvent)`。
+3. 父链上没有任何 Appender，`writes == 0`。有事件，无字节，一条 status 警告。
+4. 目标 Appender 未启动。`doAppend` ① 返回。
+5. Console 的线程内重入。File / Rolling / Async 的守卫是 NOP，不在这里死。
+6. 这个 Appender 的 Filter 链结果为 DENY。兄弟 Appender 继续。挂在 ASYNC 上时，死在入队前。
+7. 队列剩余容量 `< discardingThreshold` 且级别 ≤ INFO。不入队。WARN/ERROR 不走这条。
+8. `neverBlock=true` 且 `offer` 失败。静默丢弃。默认 `neverBlock=false` 时调用线程阻塞，不丢。
+9. 停机 `join` 超过 `maxFlushTime`（默认 1000 毫秒），队列里剩下的事件可能丢。
+10. worker 上被包裹 Appender 未启动，或它的 Filter 链为 DENY。事件已经出队。
+11. `encoder.encode` 得到 null 或空数组。`writeBytes` 直接返回。
+12. `write` 抛 IOException。这一次没有字节，Appender 被标成未启动，后续死在第 4 条。`doAppend` 里其他异常同样被吃掉，不重试。
+
+滚动本身不在这份清单里。`isTriggeringEvent` 为真只是先换文件，当前事件继续 `super.subAppend`。
+
+## 2.2 Log4j2：一条日志从调用到字节，每一次可以死掉的判断
+
+和 2.1 一样按真实调用顺序写。先写同步 Logger 加上一个 `<Async>` Appender 的路径，因为它和 Logback 的 `AsyncAppender` 最接近：全局过滤和级别在调用线程，Logger 上的 Filter 也在调用线程并且在入队之前，被包裹文件上的 Filter 在出队之后。全异步 `AsyncLogger` 把 Logger 过滤器挪到出队之后，单独放在 2.2.10，不要和这条路径混用。
+
+整数方向和 Logback 相反：OFF 0、FATAL 100、ERROR 200、WARN 300、INFO 400、DEBUG 500、TRACE 600。数值越大越啰嗦。
+
+```java
+private static final Marker FLOW = MarkerManager.getMarker("FLOW");
 private static final Marker AUDIT = MarkerManager.getMarker("AUDIT");
-private static final Marker PAYMENT =
-        MarkerManager.getMarker("PAYMENT").setParents(AUDIT);
+private static final Marker BIZ = MarkerManager.getMarker("BIZ");
+private static final Logger log = LogManager.getLogger("com.example.payment");
 
-public void login(String userId) {
-    log.info("order flow {}", userId);
-    log.info(AUDIT, "login user={}", userId);
-    log.debug(AUDIT, "login detail user={}", userId);
-    log.info(PAYMENT, "pay user={}", userId);   // 父链上有 AUDIT，过滤器认 AUDIT 时命中
+ThreadContext.put("traceId", "t-9");
+ThreadContext.put("reqType", "biz");     // health 在全局 Filter 被整次丢掉
+try {
+    log.info(BIZ, "user {} login", uid);
+} finally {
+    ThreadContext.clearMap();
 }
 ```
 
 ```xml
 <Configuration>
-  <!-- 关 A：挂在 Configuration 下，事件构造前执行 -->
-  <MarkerFilter marker="AUDIT" onMatch="ACCEPT" onMismatch="NEUTRAL"/>
+  <!-- 步 1：事件还不存在。先看 ThreadContext，再看 Marker。收成 CompositeFilter -->
+  <ThreadContextMapFilter onMatch="DENY" onMismatch="NEUTRAL">
+    <KeyValuePair key="reqType" value="health"/>
+  </ThreadContextMapFilter>
+  <MarkerFilter marker="FLOW" onMatch="DENY" onMismatch="NEUTRAL"/>
 
   <Appenders>
-    <File name="APP" fileName="logs/app.log">
-      <PatternLayout pattern="%level %msg%n"/>
-      <!-- 关 E③ Appender 自己的 Filter -->
-      <ThresholdFilter level="INFO" onMatch="NEUTRAL" onMismatch="DENY"/>
-      <MarkerFilter marker="AUDIT" onMatch="DENY" onMismatch="NEUTRAL"/>
-    </File>
-    <File name="AUDIT_FILE" fileName="logs/audit.log">
-      <PatternLayout pattern="%level %marker %msg%n"/>
-      <MarkerFilter marker="AUDIT" onMatch="ACCEPT" onMismatch="DENY"/>
-    </File>
+    <RollingFile name="FILE" fileName="logs/app.log"
+                 filePattern="logs/app.%d{yyyy-MM-dd}.log.gz">
+      <PatternLayout pattern="%d %-5level [%X{traceId}] %marker %msg%n"/>
+      <!-- 步 9：Appender 只接收一个 Filter。两个放进 Filters，按书写顺序组成 CompositeFilter -->
+      <Filters>
+        <ThresholdFilter level="INFO" onMatch="NEUTRAL" onMismatch="DENY"/>
+        <ThreadContextMapFilter onMatch="DENY" onMismatch="NEUTRAL">
+          <KeyValuePair key="traceId" value="drop-me"/>
+        </ThreadContextMapFilter>
+      </Filters>
+      <Policies><TimeBasedTriggeringPolicy/></Policies>
+    </RollingFile>
+
+    <Async name="ASYNC" bufferSize="1024" blocking="true">
+      <!-- 步 7：调用线程、入队之前。Async 自己的 Filter 可以写在这里 -->
+      <LevelMatchFilter level="ERROR" onMatch="DENY" onMismatch="NEUTRAL"/>
+      <AppenderRef ref="FILE"/>
+    </Async>
   </Appenders>
 
   <Loggers>
+    <!-- 步 5：有事件之后、入队之前。DENY 会连 root 一起切断 -->
+    <Logger name="com.example.payment" level="debug">
+      <MarkerFilter marker="AUDIT" onMatch="DENY" onMismatch="NEUTRAL"/>
+    </Logger>
     <Root level="info">
-      <AppenderRef ref="APP"/>
-      <AppenderRef ref="AUDIT_FILE"/>
+      <AppenderRef ref="ASYNC"/>
     </Root>
   </Loggers>
 </Configuration>
 ```
 
-| 调用 | 关 A | 关 B root=INFO(400) | APP | AUDIT_FILE |
-|---|---|---|---|---|
-| `info("order flow")` | 无 Marker，NEUTRAL | 400>=400 通过 | Threshold 对 INFO 匹配，NEUTRAL；Marker 不匹配，NEUTRAL | Marker 不匹配，DENY | 只在 `app.log` |
-| `info(AUDIT, ...)` | `isInstanceOf("AUDIT")`，ACCEPT，跳过关 B | 被跳过 | Marker 匹配，DENY | ACCEPT | 只在 `audit.log` |
-| `debug(AUDIT, ...)` | ACCEPT，DEBUG(500) 也被放进事件 | 被跳过 | Threshold：DEBUG 不如 INFO 具体，DENY | ACCEPT | 只在 `audit.log` |
-| `info(PAYMENT, ...)` | `PAYMENT` 的父是 `AUDIT`，`isInstanceOf("AUDIT")` 为真，ACCEPT | 被跳过 | 认 AUDIT 的 MarkerFilter DENY | ACCEPT | 只在 `audit.log` |
+`<Configuration>` 下的两个 Filter 都会挂上：`AbstractConfiguration` 对每个 Filter 子节点调用 `addFilter`（第 740-741 行），第二个进来时收成 `CompositeFilter`，顺序就是 XML 顺序。Appender 的 Builder 只有一个 `Filter` 字段（`AbstractFilterable.Builder` 第 40-41 行），所以 FILE 上的级别过滤和 `traceId` 过滤要写进 `<Filters>`，否则后一个不会绑定。`<Async>` 里面的 `<AppenderRef>` 上不能再挂 Filter，类注释写的是 references 上不允许（`AsyncAppender.java` 第 55-57 行）。FILE 里的 `<Filters>` 在 dispatcher 出队之后执行。
 
-如果把 `<MarkerFilter marker="AUDIT" onMatch="DENY" onMismatch="NEUTRAL"/>` 从 File 上挪到 `<Logger name="com.example" level="info">` 里面，它就变成关 C。此时 `info(AUDIT)` 在 `com.example` 这个 LoggerConfig 上被 DENY，`logParent` 不会执行，root 的 `AUDIT_FILE` 也写不出这一行。Appender 上的 DENY 做不到这件事。
+| 步 | 线程 | 做什么 | 这一步会死的条件 |
+|---|---|---|---|
+| 1 | 调用线程 | `<Configuration>` 上的 Filter。本例先 `ThreadContextMapFilter`（读此刻的 ThreadContext），再 `MarkerFilter`（读这次调用的 Marker） | 第一个非 NEUTRAL 是 DENY。还没有 `LogEvent` |
+| 2 | 调用线程 | 级别门 `logger.intLevel >= 本次.intLevel` | 步 1 是 NEUTRAL（或没配全局 Filter）且不等式不成立。ACCEPT 跳过本步 |
+| 3 | 调用线程 | `messageFactory.newMessage`，再经 ReliabilityStrategy 创建 `LogEvent` | 不再做全局过滤。ThreadContext 在这里拷进事件。`{}` 默认还不替换 |
+| 4 | 调用线程 | 从当前 LoggerConfig 走到父节点 | 子节点 Filter 为 DENY 时父节点根本不会被调用 |
+| 5 | 调用线程 | `LoggerConfig.isFiltered` | 只有 `Result.DENY`。ACCEPT 与 NEUTRAL 都继续，并且仍会 `logParent` |
+| 6 | 调用线程 | `AppenderControl`：AppenderRef 的 Filter、AppenderRef 的 level、重入 | 任一成立则跳过这一个 Appender |
+| 7 | 调用线程 | Appender 自己的 `isFiltered`，然后 `AsyncAppender.append` | Appender 上的 Filter 为 DENY 则不入队。未启动抛异常 |
+| 8 | 调用线程 | `offer` / 队列满时的路由 | `blocking=false` 且队列满：主队列不要，改走 error appender。`Discard` 策略下不够严重的事件直接丢掉 |
+| 9 | dispatcher | 每个下游 `AppenderControl.callAppender` | 下游未通过自己的 Filter 或 level。事件已经出队 |
+| 10 | dispatcher | `checkRollover`，然后 `layout.encode`，`write` | 布局得到空数组则不写。写失败由 ErrorHandler 处理 |
 
-## 2.3 异步多出来的关，以及它改变了谁能看见 MDC
+把 `FILE` 直接挂到 root、去掉 `<Async>` 时，没有步 8 和步 9 的分离：步 7 的 Filter 就是 FILE 的 `ThresholdFilter`，通过后立刻进入步 10，全在调用线程。
 
-同步路径走到关 E 之后若命中的是 `AsyncAppender`，顺序变成：
+### 2.2.1 入口：先 isEnabled，通过之后才创建 Message
 
-1. `AsyncAppender` 自己的 `doAppend` 仍在**调用线程**上跑它自己的 Filter 链（它也是 `AppenderBase`）。
-2. Filter 没 DENY，才进入 `AsyncAppenderBase.append`（第 161-167 行）：队列剩余容量 `< discardingThreshold` 且 `isDiscardable` 时直接丢弃。classic 的 `AsyncAppender.isDiscardable`（第 39-41 行）把 TRACE/DEBUG/INFO 视为可丢，WARN/ERROR 保留。
-3. `preprocess`（classic 第 44-47 行）在入队前调用 `prepareForDeferredProcessing()`，这一刻才把格式化后的句子、线程名、MDC 快照冻结进事件。
-4. worker 线程取出事件，调用**被包裹的那个** Appender 的 `doAppend`。被包裹 Appender 上的 Filter 跑在 worker 上。
+`logger.info("user {} login", uid)` 进入 `AbstractLogger.logIfEnabled`（`log4j-api/.../AbstractLogger.java` 第 2411-2414 行）：
 
-因此：
+```java
+public void logIfEnabled(final String fqcn, final Level level, final Marker marker,
+                         final String message, final Object... params) {
+    if (isEnabled(level, marker, message, params)) {
+        logMessage(fqcn, level, marker, message, params);
+    }
+}
+```
 
-- 写在 `<appender class="AsyncAppender">` 内部、包裹层自己身上的 Filter，看到的是调用线程的实时 `MDC.get`。
-- 写在被包裹的 `RollingFileAppender` 上的 Filter，不能再读 `MDC.get`（worker 的 ThreadLocal 是空的），要读 `event.getMDCPropertyMap()`。这份 map 在入队前已经拷好（`LoggingEvent.getMDCPropertyMap`，第 453-467 行）。
+`isEnabled` 为 false 时不会调用 `logMessage`，也就不会 `messageFactory.newMessage`（同文件第 2688-2697 行那类实现：先 `newMessage`，再 `logMessageSafely`）。占位符替换发生在 `Message.getFormattedMessage()`，不在 `isEnabled` 里。全局 Filter 能看见 format 字符串和参数数组，看不见已经拼好的句子。
 
-Log4j2 全异步（`AsyncLogger`）把关 C 及之后挪到 Disruptor 的消费线程，关 A 和关 B 仍在调用线程的 `isEnabled` 里完成。事件对象里的 `contextData` 是调用线程的 ThreadContext 快照，Appender 上的 `ThreadContextMapFilter` 读的是 `event.getContextData()`（见 4.4），所以异步之后局部 MDC 过滤仍然认的是打日志那一刻的 map。
+【源码证据】core 的 `Logger.isEnabled` 把判断交给 `PrivateConfig.filter`（`log4j-core/.../core/Logger.java` 第 199-206 行、第 532-540 行）：
+
+```java
+boolean filter(final Level level, final Marker marker, final String msg) {
+    final Filter filter = config.getFilter();          // Configuration 上的，不是 Logger 上的
+    if (filter != null) {
+        final Filter.Result r = filter.filter(logger, level, marker, msg);
+        if (r != Filter.Result.NEUTRAL) {
+            return r == Filter.Result.ACCEPT;          // ACCEPT → true；DENY → false
+        }
+    }
+    return level != null && intLevel >= level.intLevel();
+}
+```
+
+`config.getFilter()` 在 `hasFilter()`（第 528-529 行）里也是这份。挂在 `<Logger>` 上的 Filter 不在这里。
+
+### 2.2.2 全局 Filter：第一个 ACCEPT 或 DENY 结束，默认不匹配就是 DENY
+
+多于一个时收成 `CompositeFilter`。`filter(...)`（`CompositeFilter.java` 第 179-188 行）从下标 0 走到尾，当前结果是 `ACCEPT` 或 `DENY` 就返回，不再问后面的。全部 `NEUTRAL` 才把 `NEUTRAL` 交回 `PrivateConfig.filter`。只有一个全局 Filter 时不包这一层，直接调用它。
+
+单个 Filter 的默认动作和 Logback 相反。`AbstractFilter` 构造时（第 109-110 行）：`onMatch` 省略是 `NEUTRAL`，`onMismatch` 省略是 `DENY`。只写 `<MarkerFilter marker="AUDIT"/>` 且放在 `<Configuration>` 下，不带 AUDIT 的调用会在步 1 死掉，`app.log` 会空。要“只影响带标记的调用”，必须写 `onMismatch="NEUTRAL"`。
+
+这一步调用的是不带 `LogEvent` 的重载。`MarkerFilter` 只看参数里的 Marker（第 70-72 行 `isInstanceOf`）。`ThreadContextMapFilter` 的这套重载读的是调用线程上此刻的 ThreadContext（第 109-128 行 `injector.getValue`），不是事件快照。`ThresholdFilter` 只看参数里的 Level（第 76-77 行）：`testLevel.isMoreSpecificThan(配置级别)` 为真走 `onMatch`，否则 `onMismatch`。全局放一个没改默认值的 `<ThresholdFilter level="INFO"/>` 时，INFO 及以上得到 NEUTRAL 再去碰级别门，DEBUG/TRACE 得到默认的 DENY，事件不会创建。
+
+| 全局链结果 | 级别门 | 后面 |
+|---|---|---|
+| `DENY` | 不看 | `isEnabled` 返回 false，无 Message，无事件 |
+| `NEUTRAL` | `intLevel >= 本次.intLevel` 才继续 | 不成立则同样无事件 |
+| `ACCEPT` | 不看 | 继续创建 Message 和事件。root 是 INFO 时 DEBUG 也会创建 |
+
+`ACCEPT` 只跳过级别门。Logger 上的 Filter、Appender 上的 Filter、队列满时的丢弃都还在。
+
+### 2.2.3 级别门：logger 的 int 大于等于本次调用才放行
+
+`intLevel` 来自这个 Logger 所绑定的 `LoggerConfig.getLevel()`（`PrivateConfig` 构造，第 500 行、第 517-518 行）。root 配 `level="info"` 时 int 是 400。
+
+| 调用 | 本次 int | `400 >= 本次` | 结果 |
+|---|---|---|---|
+| `trace` | 600 | 假 | 死在步 2 |
+| `debug` | 500 | 假 | 死在步 2 |
+| `info` | 400 | 真 | 继续 |
+| `error` | 200 | 真 | 继续 |
+
+`Level.isMoreSpecificThan`（第 212-213 行）是 `this.intLevel <= 对方.intLevel`，越严重越“更具体”。Appender 上的 `ThresholdFilter` 用的是它，不是这道门的 `>=`。`com.example.payment` 写成 `level="debug"`（500）时，这个名字上的 DEBUG 能过步 2；root 仍是 400，别的包的 DEBUG 仍死在步 2。
+
+### 2.2.4 事件诞生：上下文先拷走，ReliabilityStrategy 不按级别丢事件
+
+`isEnabled` 为 true 之后，`Logger.logMessage`（第 169-173 行）把 Message 交给 `LoggerConfig` 的 `ReliabilityStrategy`。默认策略由系统属性 `log4j.ReliabilityStrategy` 决定，缺省字符串是 `AwaitCompletion`（`ReliabilityStrategyFactory.java` 第 47-50 行）。它的 `log(...)`（`AwaitCompletionReliabilityStrategy.java` 第 56-70 行）取当前仍有效的 `LoggerConfig`，再调用 `config.log(...)`。它不看 Level，也不按级别丢事件。停机时它会等已经开始的 `log` 结束。
+
+`LoggerConfig.log(String, ...)`（第 638-654 行）用 `logEventFactory.createEvent` 造出 `LogEvent`。同步路径上的 `ReusableLogEventFactory` 在调用线程执行 `injector.injectContextData`（`ReusableLogEventFactory.java` 第 117 行），把此刻的 ThreadContext 放进事件。此后业务线程 `ThreadContext.clearMap()`，事件里的 map 不变。`ParameterizedMessage` 的格式化字符串仍可能是懒的，直到有人调用 `getFormattedMessage()`。
+
+然后 `log(event)`（第 728-742 行）：
+
+```java
+protected void log(final LogEvent event, final LoggerConfigPredicate predicate) {
+    if (!isFiltered(event)) {
+        processLogEvent(event, predicate);
+    }
+}
+```
+
+### 2.2.5 Logger 上的 Filter：只有 DENY 才死，并且父 Logger 也收不到
+
+`AbstractFilterable.isFiltered`（第 152-153 行）：
+
+```java
+return filter != null && filter.filter(event) == Filter.Result.DENY;
+```
+
+没有 Filter 时返回 false，事件继续。结果是 `ACCEPT` 或 `NEUTRAL` 时也返回 false，事件继续。只有 `DENY` 让 `isFiltered` 为 true，`processLogEvent` 不会执行。
+
+`processLogEvent`（第 762-768 行）先 `callAppenders`，再 `logParent`。`logParent`（第 796-800 行）在 `additive && parent != null` 时调用 `parent.log(event)`。父节点的 `log` 会再执行父节点自己的 `isFiltered`。子节点已经 DENY 时，`logParent` 在 `processLogEvent` 里面，根本到不了。所以 `<Logger name="com.example.payment">` 上的 `MarkerFilter` 对 AUDIT 返回 DENY 时，root 的 ASYNC 收不到这条事件，审计文件里也没有。Logback 的 Logger 上挂不住 Filter。那边 Appender 上的 DENY 只跳过这一个 Appender，父 Logger 上的 Appender 仍会收到事件。
+
+`ACCEPT` 在这一层只是让 `CompositeFilter` 短路，不再看同级后面的 Filter。它不会跳过 `logParent`，也不会强迫 Appender 写入。
+
+本例 `com.example.payment` 的 MarkerFilter：`onMatch=DENY`、`onMismatch=NEUTRAL`。`log.info(AUDIT, ...)` 从 `com.example.payment` 的 Logger 打出时死在步 5，不入队。同一个 AUDIT 从别的包打出时，那个 Logger 没有这道 Filter，事件走到 root，可以入队。
+
+### 2.2.6 AppenderControl：三道都在调用 append 之前
+
+`callAppenders`（第 803-808 行）遍历 `AppenderControl[]`。`callAppender`（`AppenderControl.java` 第 84-104 行、第 130-156 行）：
+
+```java
+public void callAppender(final LogEvent event) {
+    if (shouldSkip(event)) {
+        return;
+    }
+    callAppenderPreventRecursion(event);
+}
+private boolean shouldSkip(final LogEvent event) {
+    return isFilteredByAppenderControl(event)   // ① AppenderRef 上的 Filter，仅 DENY
+        || isFilteredByLevel(event)             // ② <AppenderRef level="...">
+        || isRecursiveCall();                   // ③ 同一 AppenderControl 重入
+}
+private boolean isFilteredByLevel(final LogEvent event) {
+    return level != null && intLevel < event.getLevel().intLevel();
+}
+private boolean isFilteredByAppender(final LogEvent event) {
+    return appender instanceof Filterable && ((Filterable) appender).isFiltered(event);
+}
+```
+
+① 只认 DENY，和 Logger 那层一样。`ACCEPT` 不会让 ② 被跳过：`shouldSkip` 先看 ①，① 不是 DENY 就继续看 ②。AppenderRef 上的 Filter 返回 ACCEPT，级别仍可能把事件跳过。
+
+② 没写 `level` 时 `level` 为 null，`isFilteredByLevel` 第 103 行直接为假（构造时把 int 记成 `Level.ALL`，第 57 行，但比较之前先看引用是不是 null）。写了 `level="ERROR"`（200）时：事件 INFO（400）满足 `200 < 400`，跳过；事件 ERROR（200）和 FATAL（100）不满足，继续。留下的是至少和 ref 一样具体的事件。
+
+③ `recursive` 是 `ThreadLocal`。同一线程在这个 `AppenderControl` 里再次 `callAppender`（编码或 `toString` 里又打日志，并且又走到同一个 Appender）时返回，避免死锁。File 路径上这是会丢事件的重入点。
+
+三道都过了，`callAppender0` 再看 ④：Appender 元素内部的 Filter，仍然只有 DENY 才算过滤掉（`isFiltered` 同 2.2.5）。本例 ASYNC 上的 `LevelMatchFilter` 在这里执行，在 `append()` 之前。ERROR 匹配则 DENY，不入队；其他级别 `onMismatch=NEUTRAL`，`isFiltered` 为 false，进入 `append()`。
+
+兄弟 `AppenderControl` 独立。一个 DENY 不阻止数组里的下一个。
+
+### 2.2.7 入队：memento 先冻结，offer 失败才谈阻塞或丢弃
+
+`AsyncAppender.append`（第 161-182 行）在自己的 Filter 已经放过之后：
+
+```java
+if (!isStarted()) {
+    throw new IllegalStateException("AsyncAppender " + getName() + " is not active");
+}
+final Log4jLogEvent memento = Log4jLogEvent.createMemento(logEvent, includeLocation);
+InternalAsyncUtil.makeMessageImmutable(logEvent.getMessage());
+if (!transfer(memento)) {
+    if (blocking) {
+        ...
+    } else {
+        error("... queue is full");
+        logToErrorAppenderIfNecessary(false, memento);
+    }
+}
+```
+
+未启动时 `append` 抛 `IllegalStateException`。`AppenderControl.tryCallAppender` 接住它（第 158-164 行）；`ignoreExceptions` 为 true（Appender 的默认）时业务线程看不到这个异常。这一次没有入队。
+
+`createMemento` 走 `Log4jLogEvent.Builder`（`Log4jLogEvent.java` 第 1005-1006 行、第 161-164 行）：普通 Message 在这里就调用 `InternalAsyncUtil.makeMessageImmutable`；`ReusableMessage` 则 `memento()` 拷出一份。`append` 第 166 行对原事件再调一次 `makeMessageImmutable`。`includeLocation` 默认 false（Builder 第 328 行），不在调用线程抓栈。`makeMessageImmutable`（`InternalAsyncUtil.java` 第 38-42 行）在系统属性没要求后台格式化、Message 也没有 `@AsynchronouslyFormattable` 时立刻 `getFormattedMessage()`。参数在入队前被烤进字符串，调用线程随后改参数数组也不影响队列里的句子。上下文 map 若还没冻结，Builder 会再拷一份（第 167-171 行）。
+
+`transfer`（第 185-188 行）：队列是 `TransferQueue` 时 `tryTransfer`（有消费者在等就直接交给它，不必进队列）；否则 `offer`。成功则调用线程到此结束，事件活在队列里。
+
+`offer` 失败且 `blocking=true`（Builder 默认，第 315 行）：
+
+- 递归深度大于 1：不再等待，改在当前线程 `dispatch`，避免和后台线程互相等死（第 169-171 行）。
+- 否则问 `AsyncQueueFullPolicy.getRoute`：
+  - `DefaultAsyncQueueFullPolicy`（第 29-42 行）：普通调用线程得到 `ENQUEUE`，`queue.put` 阻塞到有空位（第 206-209 行）。当前线程就是后台线程或 `Log4jThread` 时得到 `SYNCHRONOUS`，在当前线程直接 `dispatch`，不入队。
+  - `DiscardingAsyncQueueFullPolicy`（第 48-60 行）：`level.isLessSpecificThan(threshold)` 为真则 `DISCARD`。`isLessSpecificThan` 是 `this.intLevel >= threshold.intLevel`（`Level.java` 第 196-197 行）。属性 `log4j2.asyncQueueFullPolicy=Discard` 时阈值默认 INFO（`AsyncQueueFullPolicyFactory.java` 第 107 行）。队列满时 INFO/DEBUG/TRACE 被丢掉，WARN/ERROR/FATAL 走默认策略继续排队或同步写。第一次丢弃打一条 status，之后静默。
+  - `put` 被中断时再 `offer` 一次（第 227-233 行）。第二次仍失败才警告，并尽量交给 error appender。中断标记会补回调用线程。注释写明第二次 `offer` 成功时，存在和第一次重复的可能。
+
+`offer` 失败且 `blocking=false`：不阻塞。记一条 error，若配置了 `errorRef`，把 memento 交给那个 Appender（仍在调用线程，会走那个 Appender 的 `callAppender`，包括它的 Filter）。主文件没有这一行。
+
+队列容量默认 1024（`DEFAULT_QUEUE_SIZE`，第 62 行；Builder 的 `bufferSize` 初始值，第 321 行）。停机等待默认 0（第 318 行），createAppender 的参数说明写的是 0 表示一直等到队列排空（第 251-253 行）。
+
+### 2.2.8 出队：下游 Appender 再走一遍 AppenderControl
+
+`AsyncAppenderEventDispatcher.dispatch`（第 119-134 行）在 dispatcher 线程上，对每个下游 `AppenderControl.callAppender`。FILE 的 `ThresholdFilter`、FILE 的 `AppenderRef` level、FILE 的重入检查都在这里。事件已经离开 ASYNC 的队列。
+
+这一刻 `ThreadContext` 是 dispatcher 的，通常是空的。`ThreadContextMapFilter` 若写在 FILE 上，走的是 `filter(LogEvent)`（`ThreadContextMapFilter.java` 第 131-132 行），读 `event.getContextData()`，那是步 3 或 `createMemento` 时拷走的 map。写在 `<Configuration>` 上的同名过滤器早在步 1 就用调用线程的实时 map 做过决定，不会在这里再做一次。
+
+某个下游 `callAppender` 抛异常只记 trace，换下一个下游。全部失败且配置了 error appender 时，再 `errorAppender.callAppender`（第 136-139 行）。error appender 自己的 Filter 仍会执行。
+
+### 2.2.9 写字节
+
+FILE 的 `RollingFileAppender.append`（第 479-481 行）先 `getManager().checkRollover(event)`，再 `super.append`。滚动不丢当前事件。`AbstractOutputStreamAppender.tryAppend`（第 218-223 行）在直接编码器打开时 `layout.encode` 写入 manager，并在 `immediateFlush` 或 `endOfBatch` 时 `flush`（第 226-230 行）；否则 `toByteArray`，数组非空才 `manager.write`（第 233-237 行）。空数组没有字节，也不算一条新的死亡异常。写失败由 `append` 第 212-214 行交给 ErrorHandler，再把异常抛出去，由 `AppenderControl.tryCallAppender` 接住（第 158-164 行）。
+
+### 2.2.10 全异步 AsyncLogger：Logger 过滤器在出队之后
+
+`log4j2.contextSelector=org.apache.logging.log4j.core.async.AsyncLoggerContextSelector`，或者代码拿到的是 `AsyncLogger` 时，步 1 和步 2 仍在调用线程的 `isEnabled` 里。没通过就不会 `publish`。通过之后，ThreadLocal 复用路径调用 `publish`（第 235-241 行、第 271-274 行）；参数数组路径直接 `tryPublishEvent`（第 399-411 行）。两条都不经过同步的 `LoggerConfig.log`。发布失败才进入满环处理。
+
+Disruptor 的 `translateTo` 跑在调用线程上（`RingBufferLogEventTranslator.java` 第 62-82 行）。它调用 `INJECTOR.injectContextData`，ThreadContext 在发布前拷进环上的事件。线程名、线程 id 用的是 translator 里已经记下的调用线程的值（第 56-58 行），不是消费线程。同一条 `setValues` 里会 `setMessage`：`ReusableMessage` 当场 `formatTo`，其他 Message 走 `makeMessageImmutable`（`RingBufferLogEvent.java` 第 143-152 行）。占位符在入环前替换，除非打开了后台格式化。
+
+环的默认容量：开了 ThreadLocal 复用时 4096，否则 `256 * 1024`（`DisruptorUtil.java` 第 35-37 行、第 87-88 行）。
+
+环满时 `handleRingBufferFull`（第 277-301 行）和 AsyncAppender 同一套 `EventRoute`：递归调用改走当前线程；`DISCARD` 则 `translator.clear()`，事件消失；`ENQUEUE` 等待可发布；`SYNCHRONOUS` 在当前线程写。`Discard` 策略同样是“不比阈值更具体的级别丢掉”，默认阈值 INFO。
+
+消费线程执行 `RingBufferLogEvent.execute`（第 170-172 行）→ `actualAsyncLog`（第 560-568 行）→ `reliabilityStrategy.log(this, event)`。`Logger` 实现了 `Supplier<LoggerConfig>`（`Logger.java` 第 56 行），所以这是 `AwaitCompletionReliabilityStrategy.log(Supplier, LogEvent)`（第 105-111 行），里面再 `config.log(event)`。**步 5 的 `isFiltered` 发生在这里**，用的是 `filter(LogEvent)`，读事件里的 context data，不是消费线程的 ThreadContext。DENY 仍然切断 `logParent`。Appender 的 Filter 也在这条消费线程上，紧挨着写文件，中间没有再入一次队（除非 Appender 自己又是 `<Async>`）。
+
+因此同一份 `<Logger>` 上的 `MarkerFilter`：
+
+| 运行方式 | 它在哪执行 | 队列里有没有这条 |
+|---|---|---|
+| 同步 Logger + `<Async>` Appender | 调用线程，入队前 | DENY 则没有 |
+| `AsyncLogger` | Disruptor 消费线程，出队后 | 先占了一个环槽，再被 Logger 过滤器丢掉 |
+
+`AsyncLoggerConfig`（只把部分 Logger 配成 async）夹在两者中间。第一次遇到带 Appender 的 `AsyncLoggerConfig` 时（第 128-157 行）：先在调用线程 `isFiltered`，DENY 则同步和异步都不做。没 DENY 则先 `processLogEvent(..., SYNCHRONOUS_ONLY)` 把同步 Appender 在调用线程写完，再 `tryEnqueue`。后台线程回调 `logToAsyncLoggerConfigsOnCurrentThread`（第 203-205 行）时注释写明跳过已经在调用线程做过的 Filter，只 `processLogEvent(..., ASYNCHRONOUS_ONLY)`。队列满的路由和上面相同（第 174-183 行）。
+
+### 2.2.11 把本例的调用走完
+
+配置用本节开头那份。调用发生在 `com.example.payment`（Logger 级别 DEBUG，且有 AUDIT 的 DENY）。步 1 两个全局 Filter 收成 `CompositeFilter`：`reqType=health` 整次 DENY；`FLOW` 整次 DENY；其余 NEUTRAL，交给级别门。FILE 在出队后再看 `traceId` 是不是 `drop-me`。队列未满。`<Async>` 的 `blocking=true`。没另行注明时，线程上是 `traceId=t-9`、`reqType=biz`。
+
+| 调用 | MDC | Marker | 步 1 全局 | 步 2 级别（这个 Logger 是 DEBUG=500） | 步 5 Logger 的 MarkerFilter | 步 7 ASYNC 的 LevelMatch | 步 9 FILE | 磁盘 |
+|---|---|---|---|---|---|---|---|---|
+| `info(BIZ, "user {} login", uid)` | `reqType=health`，`traceId=t-9` | BIZ | **ThreadContextMapFilter DENY**。MarkerFilter 不再执行 | 不到 | 不到 | 不到 | 不到 | 无。没有 Message，没有事件 |
+| `info(FLOW, "user {} login", uid)` | `reqType=biz`，`traceId=t-9` | FLOW | MapFilter NEUTRAL，**MarkerFilter DENY** | 不到 | 不到 | 不到 | 不到 | 无。没有事件 |
+| `debug(BIZ, "user {} login", uid)` | `reqType=biz`，`traceId=t-9` | BIZ | 两道都 NEUTRAL。BIZ 不是 FLOW | 500>=500，过 | 不是 AUDIT，NEUTRAL | 不是 ERROR，NEUTRAL，入队。入队前格式化，contextData 里有 `t-9` | Threshold：DEBUG 不如 INFO 具体，DENY。traceId 过滤器不再问 | 无。事件已出队 |
+| `info(BIZ, "user {} login", uid)` | `reqType=biz`，`traceId=t-9` | BIZ | NEUTRAL | 过 | NEUTRAL | 入队 | Threshold NEUTRAL；`traceId` 不是 `drop-me`，NEUTRAL，写 | `app.log` 有 `[t-9] BIZ user … login`。dispatcher 的 ThreadContext 是空的，`%X` 和 FILE 上的 MapFilter 用的都是事件里那份 |
+| `info("user {} login", uid)` | `reqType=biz`，`traceId=t-9` | 无 | Marker 为 null，走 onMismatch，NEUTRAL | 过 | NEUTRAL | 入队 | 写 | `app.log` 有 `[t-9]`，marker 那一格是空的 |
+| `info(BIZ, "user {} login", uid)` | `reqType=biz`，`traceId=drop-me` | BIZ | NEUTRAL（`drop-me` 不是 health） | 过 | NEUTRAL | 入队。memento 里的 traceId 已是 `drop-me` | Threshold NEUTRAL，**MapFilter DENY** | 无。事件已出队。调用线程上后来 `clearMap()` 也改变不了这个判断 |
+| `error(BIZ, "user {} login", uid)` | `reqType=biz`，`traceId=t-9` | BIZ | NEUTRAL | 过 | NEUTRAL | **DENY**，不入队 | 不到 | 无 |
+| `info(AUDIT, "user {} login", uid)` | `reqType=biz`，`traceId=t-9` | AUDIT | NEUTRAL | 过 | **DENY**，`logParent` 不执行 | 不到 | 不到 | 无。root 的文件也没有 |
+| 别的包 `debug(BIZ, ...)`，该包 Logger 仍是 INFO=400 | `reqType=biz` | BIZ | NEUTRAL | 400>=500 为假 | 不到 | 不到 | 不到 | 无。没有事件 |
+
+`log.info` 返回之后业务线程立刻 `ThreadContext.clearMap()`，不影响已经入队的那条：contextData 在创建事件和 `createMemento` 时已经拷走。
+
+把全局 `MarkerFilter` 配成对 `AUDIT` `onMatch=ACCEPT`、`onMismatch=NEUTRAL`，并且把它放在 ThreadContextMapFilter 之后时，`debug(AUDIT)` 在 `reqType=biz` 下能跳过步 2。它仍然要过步 5：本例步 5 对 AUDIT 是 DENY，所以还是进不了队列。全局 ACCEPT 只改步 2。步 5 和步 9 仍按各自的 Filter 执行。`reqType=health` 时排在前面的 MapFilter 已经 DENY，AUDIT 的 ACCEPT 不会被执行。
+
+队列已满且使用默认阻塞策略时，`info(BIZ, ...)` 会停在 `put` 上，不丢。换成 `Discard` 且阈值 INFO 时，这条 `info` 在步 8 被丢掉，`error` 仍会排队；但本例的 `error` 在步 7 就已经死了，轮不到步 8。Marker 和 MDC 不参与这道丢弃，它只看级别。
+
+改成 `AsyncLogger` 之后，上表步 5 和步 7、步 9 都挪到消费线程。`info(AUDIT)` 会先占环槽，再在消费线程被 Logger 的 MarkerFilter 丢掉，文件里仍然没有。步 1 的 ThreadContext 和 Marker 仍在调用线程上决定，`reqType=health` 或 `FLOW` 不会入环。`traceId` 在 `translateTo` 里拷进环上的事件，步 9 的 MapFilter 读的是这份拷贝。
+
+### 2.2.12 死亡点清单
+
+1. 全局 Filter 第一个非 NEUTRAL 是 DENY。无 Message，无事件。省略 `onMismatch` 时默认就是这条。
+2. 全局结果是 NEUTRAL，且 `logger.intLevel >= 本次.intLevel` 不成立。无事件。
+3. LoggerConfig 的 `filter(event)` 为 DENY。父 LoggerConfig 不再收到。同步加 `<Async>` 时死在入队前；`AsyncLogger` 时死在出队后。
+4. AppenderRef 上的 Filter 为 DENY，或 AppenderRef 的 `level` 比事件更具体（`ref.intLevel < event.intLevel`），或同一 `AppenderControl` 重入。只跳过这一个 Appender。
+5. Appender 自己的 Filter 为 DENY。挂在 `<Async>` 上时不入队。
+6. `<Async>` 未启动。`append` 抛 `IllegalStateException`。
+7. 队列满且 `blocking=false`。主队列不要；有 `errorRef` 才在调用线程再试一次。
+8. 队列满且策略为 `Discard`，事件 `isLessSpecificThan(阈值)`。默认阈值 INFO，即 INFO 及更啰嗦的丢掉，WARN 及以上继续。
+9. dispatcher 上下游 Appender 的 Filter、level 或重入把事件跳过。事件已经出队。
+10. `layout.toByteArray` 为空。不写。
+11. 写失败。这一次没有字节。是否再抛给业务线程由 `ignoreExceptions` 决定。
+
+滚动不在这份清单里。`checkRollover` 之后仍会 `super.append`。
+
+## 2.3 两种引擎里，Filter 相对队列的位置
+
+| | 全局 Filter | 级别门 | Logger 上的 Filter | 包裹层 Appender 的 Filter | 被包裹文件的 Filter | 队列快满时丢掉谁 |
+|---|---|---|---|---|---|---|
+| Logback `AsyncAppender` | 调用线程，事件前，TurboFilter | 调用线程，仅当 Turbo 为 NEUTRAL | 没有这一层 | 调用线程，入队前 | worker，出队后 | 剩余容量 `< queueSize/5` 且级别 ≤ INFO |
+| Log4j2 同步 Logger + `<Async>` | 调用线程，事件前 | 调用线程，仅当全局为 NEUTRAL | 调用线程，入队前；DENY 切断父 Logger | 调用线程，入队前 | dispatcher，出队后 | 默认阻塞。`Discard` 时默认丢掉 INFO 及更啰嗦的 |
+| Log4j2 `AsyncLogger` | 调用线程，事件前 | 调用线程 | **消费线程，出队后**；DENY 仍切断父 Logger | 消费线程，若 Appender 自己又是异步则再入一次队 | 再下一层的消费线程 | 环满时的 `EventRoute`。`Discard` 规则同上 |
+
+三处读 MDC / ThreadContext 的时机也按这个表：全局 Filter 读调用线程的实时 map；入队前已经 `injectContextData` 或 `createMemento` 的事件，出队后的 Filter 要读事件里的那份。Log4j2 出队后的 `ThreadContextMapFilter.filter(LogEvent)` 就是这么读的。
 
 ## 2.4 本章小结
 
-- 写入文件之前至少有：全局 Filter → Logger 级别门 →（Log4j2 还有 LoggerConfig Filter）→ additive 父链 → 每个 Appender 自己的 Filter →（异步则再加丢弃关）→ 滚动 → 编码写字节。
-- 消息格式化发生在 Filter 放行之后的 `prepareForDeferredProcessing` / Layout 编码，关 A 看到的是 format 字符串和参数数组。
-- Logback：Appender 链只有 DENY 才不写，ACCEPT 与全 NEUTRAL 都写。
-- Log4j2：全局 Filter 的默认 `onMismatch` 是 DENY；LoggerConfig 上的 DENY 会连父节点一起切断；AppenderRef 的 `level` 是按"更具体才留"比较 intLevel。
+- Logback 传统 API 的顺序是：TurboFilter 链（第一个 DENY/ACCEPT 结束）→ 仅当结果为 NEUTRAL 才做级别比较 → 构造 `LoggingEvent` → 沿 additive 父链 `doAppend`。Fluent API 的级别比较在 `atXxx()`，`log(LoggingEvent)` 只再认一次 TurboFilter 的 DENY。
+- 1.5 的 File、RollingFile、Console、Async 都走 `UnsynchronizedAppenderBase.doAppend`：未启动则死，Filter 链只有 DENY 才不调用 `append()`，整链 NEUTRAL 仍会写。File 与 Async 的重入守卫是 NOP；Console 用线程内守卫挡住递归。
+- 挂在 Logback `AsyncAppender` 上的 Filter 在调用线程、入队之前。队列快满时丢掉级别 ≤ INFO 的事件。`preprocess` 在入队前格式化句子并拷贝 MDC。被包裹文件上的 Filter 在 worker 的第二次 `doAppend` 里执行，这时要读事件里的 MDC 快照。
+- Logback 滚动不丢当前事件。空的编码结果和 IOException 会让这一次没有字节；IOException 还会把 Appender 标成未启动。
+- Log4j2：`isEnabled` 里先走 Configuration 级 Filter。非 NEUTRAL 时只有 ACCEPT 继续，DENY 直接结束；NEUTRAL 才比较 `intLevel >= 本次.intLevel`。通过之后才 `newMessage` 和创建事件。省略 `onMismatch` 时默认 DENY。
+- LoggerConfig 只有 DENY 才丢，并且父节点不再收到。AppenderRef 的 `level` 按“ref 的 int 小于事件的 int 就跳过”比较。Appender 自己的 Filter 同样只认 DENY。
+- `<Async>`：Logger 过滤器和 Async 自己的过滤器都在调用线程、入队之前；`createMemento` 时句子和 ThreadContext 已经冻结；文件上的过滤器在 dispatcher 出队之后。默认队列 1024，满了阻塞。`Discard` 在队列满时丢掉不比阈值更具体的级别，默认阈值 INFO。
+- `AsyncLogger`：全局 Filter 和级别门仍在调用线程。Logger 过滤器和 Appender 过滤器在消费线程，DENY 发生时环槽已经被占过。上下文拷贝和消息冻结发生在调用线程的 `translateTo` 里。
 
 ---
 
@@ -456,7 +967,7 @@ Marker AUDIT = MarkerManager.getMarker("AUDIT");
 Marker PAYMENT = MarkerManager.getMarker("PAYMENT").setParents(AUDIT);
 ```
 
-此时 `PAYMENT.isInstanceOf("AUDIT")` 为真，`AUDIT.isInstanceOf("PAYMENT")` 为假。放进 2.2.1 里 `marker="AUDIT"` 且 `onMismatch="DENY"` 的 `AUDIT_FILE`：
+此时 `PAYMENT.isInstanceOf("AUDIT")` 为真，`AUDIT.isInstanceOf("PAYMENT")` 为假。文件上的 `MarkerFilter` 若是 `marker="AUDIT"` 且 `onMismatch="DENY"`：
 
 | 打出去的 Marker | `isInstanceOf("AUDIT")` | `isInstanceOf("PAYMENT")` | 过滤器配 `AUDIT` | 过滤器配 `PAYMENT` |
 |---|---|---|---|---|
