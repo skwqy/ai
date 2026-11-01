@@ -1,0 +1,624 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>分位数与直方图桶：Micrometer / Prometheus 指标模型剖析</title>
+<style>
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%;scroll-behavior:smooth}
+  body{margin:0;background:#fff;color:#14181f;font:15px/1.75 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;-webkit-font-smoothing:antialiased}
+  .shell{max-width:1520px;margin:0 auto;padding:0 48px;display:grid;grid-template-columns:232px minmax(0,1fr);gap:56px}
+  .page{min-width:0;padding:64px 0 120px}
+  /* 常驻大纲（宽屏） */
+  .outline{position:sticky;top:0;align-self:start;height:100vh;overflow-y:auto;padding:68px 0 40px;font-size:13px;scrollbar-width:thin}
+  .outline::-webkit-scrollbar{width:6px}
+  .outline::-webkit-scrollbar-thumb{background:#e6e8eb;border-radius:3px}
+  .outline-title{font-size:11px;letter-spacing:.16em;color:#9aa1ab;margin-bottom:12px}
+  .outline ol{list-style:none;margin:0;padding:0;border-left:1px solid #e6e8eb}
+  .outline li{margin:0}
+  .outline .lvl1:first-child{margin-top:0}
+  .outline .lvl1+.lvl1{margin-top:6px}
+  .outline a{display:block;margin-left:-1px;padding:5px 8px 5px 13px;border-left:2px solid transparent;color:#6b7280;text-decoration:none;line-height:1.5;transition:color .15s,border-color .15s}
+  .outline a:hover{color:#1a5fb4}
+  .outline .lvl1 a{font-size:13.5px;color:#454d59}
+  .outline .lvl1 .o-num{color:#a8aeb8;font-variant-numeric:tabular-nums;margin-right:7px;font-size:12px}
+  .outline .lvl2 a{font-size:12.5px;padding-left:26px;color:#737b86}
+  .outline a.active{color:#1a5fb4;border-left-color:#1a5fb4;font-weight:500}
+  .outline .lvl1 a.active .o-num{color:#7fa8db}
+  .kicker{font-size:12px;letter-spacing:.14em;color:#8b949e;text-transform:uppercase;margin-bottom:14px}
+  h1{font-size:30px;line-height:1.3;margin:0 0 14px;font-weight:600;letter-spacing:-.01em}
+  .lede{font-size:16px;color:#4b5563;margin:0 0 18px;max-width:920px}
+  .meta{font-size:13px;color:#8b949e;padding-bottom:22px;border-bottom:1px solid #e6e8eb}
+  .toc{background:#f7f8fa;border:1px solid #e6e8eb;border-radius:12px;padding:18px 24px;margin:32px 0 8px}
+  .toc-title{font-size:12px;letter-spacing:.1em;color:#8b949e;margin-bottom:10px}
+  .toc ol{margin:0;padding-left:20px;columns:2;column-gap:32px}
+  .toc li{margin:4px 0;font-size:14px;break-inside:avoid}
+  .toc a{color:#1a5fb4;text-decoration:none}
+  .toc a:hover{text-decoration:underline}
+  h2{font-size:22px;margin:60px 0 18px;padding-bottom:10px;border-bottom:1px solid #e6e8eb;font-weight:600;scroll-margin-top:28px}
+  h2 .num{color:#b0b6bf;font-weight:500;margin-right:10px;font-variant-numeric:tabular-nums}
+  h3{font-size:16.5px;margin:34px 0 12px;font-weight:600;scroll-margin-top:28px}
+  p{margin:0 0 16px}
+  ul,ol{margin:0 0 16px;padding-left:24px}
+  li{margin:6px 0}
+  strong{font-weight:600}
+  code{font-family:ui-monospace,SFMono-Regular,"JetBrains Mono",Consolas,monospace;font-size:.88em;background:#f2f4f6;padding:1px 5px;border-radius:4px;color:#0f172a}
+  pre{background:#f7f8fa;border:1px solid #e6e8eb;border-radius:10px;padding:16px 18px;overflow-x:auto;margin:20px 0}
+  pre code{background:none;padding:0;font-size:13px;line-height:1.7;color:#1f2937}
+  table{width:100%;border-collapse:collapse;margin:22px 0;font-size:14px}
+  th{background:#f7f8fa;text-align:left;font-weight:600;font-size:13px;color:#4b5563;padding:10px 14px;border:1px solid #e6e8eb;white-space:nowrap}
+  td{padding:10px 14px;border:1px solid #eceef1;vertical-align:top}
+  tbody tr:nth-child(even){background:#fcfcfd}
+  figure{margin:30px 0}
+  figure svg{display:block;width:100%;height:auto}
+  figcaption{font-size:13px;color:#6b7280;text-align:center;margin-top:12px;line-height:1.6}
+  .callout{border-left:3px solid #1a5fb4;background:#f4f8fd;padding:15px 20px;margin:24px 0;border-radius:0 8px 8px 0;font-size:14.5px}
+  .callout p:last-child{margin-bottom:0}
+  .callout.warn{border-color:#c2761a;background:#fdf7ef}
+  .callout.rule{border-color:#b0b6bf;background:#f7f8fa}
+  .callout .label{display:block;font-size:12px;letter-spacing:.08em;color:#8b949e;margin-bottom:6px}
+  .legend{display:flex;flex-wrap:wrap;gap:18px;font-size:12.5px;color:#6b7280;margin-bottom:10px}
+  .legend span{display:flex;align-items:center;gap:6px}
+  .sw{width:11px;height:11px;border-radius:2px;background:#b5d4f4;border:.5px solid #378add}
+  .ln{width:15px;height:2px;background:#1a5fb4}
+  .dt{width:9px;height:9px;border-radius:50%;background:#ba7517}
+  .cards{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:24px 0}
+  .card{border-radius:10px;padding:18px 20px}
+  .card .tag{font-size:12px;margin-bottom:6px;letter-spacing:.02em}
+  .card .big{font-size:26px;font-weight:600;margin-bottom:8px;font-variant-numeric:tabular-nums}
+  .card p{font-size:13.5px;line-height:1.65;margin:0}
+  .card.bad{background:#fdf2f2;border:1px solid #f0c9c9}
+  .card.bad .tag{color:#a32d2d}
+  .card.bad .big{color:#501313}
+  .card.bad p{color:#7c2222}
+  .card.good{background:#f2f8ee;border:1px solid #c9e0b8}
+  .card.good .tag{color:#3b6d11}
+  .card.good .big{color:#173404}
+  .card.good p{color:#27500a}
+  .chips{display:flex;flex-wrap:wrap;gap:8px;margin:18px 0 10px}
+  .chip{background:#f2f4f6;border-radius:8px;padding:7px 12px;font-size:12.5px;color:#4b5563;font-variant-numeric:tabular-nums}
+  .check{list-style:none;padding-left:0}
+  .check li{padding-left:26px;position:relative;margin:9px 0}
+  .check li::before{content:"";position:absolute;left:0;top:7px;width:12px;height:12px;border:1.5px solid #b0b6bf;border-radius:3px}
+  footer{margin-top:80px;padding-top:22px;border-top:1px solid #e6e8eb;font-size:13px;color:#8b949e}
+  footer a{color:#1a5fb4;text-decoration:none}
+  footer li{margin:5px 0}
+  @media (max-width:1180px){.outline{display:none}.shell{grid-template-columns:minmax(0,1fr);padding:0 28px}}
+  @media (min-width:1181px){.toc{display:none}}
+  @media (max-width:680px){.shell{padding:0 18px}.page{padding:40px 0 80px}.toc ol{columns:1}h1{font-size:24px}.cards{grid-template-columns:1fr}}
+  @media print{.shell{display:block;max-width:none;padding:0}.outline{display:none}.toc{display:none}.page{padding:0}h2{page-break-after:avoid}figure,table,pre{page-break-inside:avoid}}
+</style>
+</head>
+<body>
+<div class="shell">
+
+  <aside class="outline">
+    <div class="outline-title">大纲</div>
+    <ol id="outline-list">
+      <li class="lvl1"><a href="#concept"><span class="o-num">01</span>一图看清两者的关系</a></li>
+      <li class="lvl1"><a href="#bucket"><span class="o-num">02</span>直方图桶：把分布切成格子</a></li>
+      <li class="lvl1"><a href="#percentile"><span class="o-num">03</span>分位数：在曲线上读一个位置</a></li>
+      <li class="lvl1"><a href="#micrometer"><span class="o-num">04</span>在 Micrometer 里怎么配</a></li>
+      <li class="lvl1"><a href="#pitfalls"><span class="o-num">05</span>五个高频误用</a></li>
+      <li class="lvl1"><a href="#appendix"><span class="o-num">06</span>附录：1000 次调用的完整算例</a></li>
+    </ol>
+  </aside>
+
+  <main class="page">
+
+  <div class="kicker">Micrometer / Prometheus 指标模型</div>
+  <h1>分位数与直方图桶</h1>
+  <p class="lede">它们不是两个并列的指标，而是同一件事的两种表示：<strong>桶是原料，分位数是用原料加工出来的成品</strong>。理解这一层，才能看懂为什么"服务端 P99"只能建在桶上。</p>
+  <div class="meta">2026-11-01 · 配套文档《Micrometer&amp;Tracing 抽象设计》第 8 章</div>
+
+  <nav class="toc">
+    <div class="toc-title">目录</div>
+    <ol>
+      <li><a href="#concept">一图看清两者的关系</a></li>
+      <li><a href="#bucket">直方图桶：把分布切成格子</a></li>
+      <li><a href="#percentile">分位数：在曲线上读一个位置</a></li>
+      <li><a href="#micrometer">在 Micrometer 里怎么配</a></li>
+      <li><a href="#pitfalls">五个高频误用</a></li>
+      <li><a href="#appendix">附录：1000 次调用的完整算例</a></li>
+    </ol>
+  </nav>
+
+  <div class="callout rule">
+    <span class="label">三句话结论</span>
+    <p><strong>桶</strong>是一组固定边界上的累计计数，可相加、可合并，是唯一能跨实例算全局分位数的原料。<br>
+    <strong>分位数</strong>是排序后第 N% 位置上的值，抗长尾、可读性强，但<strong>不可平均、不可相加</strong>。<br>
+    <strong>配置</strong>上：服务端多实例只开直方图；客户端分位数只用于单实例诊断。</p>
+  </div>
+
+  <h2 id="concept"><span class="num">01</span>一图看清两者的关系</h2>
+
+  <p>下面是一个真实形状的耗时分布（1000 次调用）。柱子是"落在每个耗时区间的次数"，折线是"累计占比"，橙点是"在累计曲线上读出分位数"的位置。</p>
+
+  <figure>
+    <div class="legend">
+      <span><i class="sw"></i>桶内次数</span>
+      <span><i class="ln"></i>累计占比</span>
+      <span><i class="dt"></i>分位点</span>
+    </div>
+    <svg viewBox="0 0 680 332" role="img" aria-labelledby="f1t f1d">
+      <title id="f1t">耗时直方图与累计占比曲线，标出 P50、P95、P99 在曲线上的读取位置</title>
+      <desc id="f1d">柱状图为每个耗时区间内的调用次数，折线为累计占比。P50 约 36 毫秒，P95 约 375 毫秒，P99 约 750 毫秒。</desc>
+      <text x="76" y="56" font-size="11" fill="#888780">累计占比</text>
+      <line x1="76" y1="80" x2="630" y2="80" stroke="#e6e8eb" stroke-width="0.5"/>
+      <line x1="76" y1="170" x2="630" y2="170" stroke="#d3d1c7" stroke-width="0.5" stroke-dasharray="3 3"/>
+      <line x1="76" y1="260" x2="630" y2="260" stroke="#b4b2a9" stroke-width="0.5"/>
+      <text x="68" y="84" text-anchor="end" font-size="11" fill="#888780">100%</text>
+      <text x="68" y="174" text-anchor="end" font-size="11" fill="#888780">50%</text>
+      <text x="68" y="264" text-anchor="end" font-size="11" fill="#888780">0</text>
+      <rect x="93.9" y="185" width="64.9" height="75" rx="2" fill="#b5d4f4" stroke="#378add" stroke-width="0.5"/>
+      <rect x="161.8" y="110" width="86.9" height="150" rx="2" fill="#b5d4f4" stroke="#378add" stroke-width="0.5"/>
+      <rect x="251.7" y="60" width="65" height="200" rx="2" fill="#b5d4f4" stroke="#378add" stroke-width="0.5"/>
+      <rect x="319.6" y="166.3" width="64.9" height="93.7" rx="2" fill="#b5d4f4" stroke="#378add" stroke-width="0.5"/>
+      <rect x="387.6" y="203.8" width="86.9" height="56.2" rx="2" fill="#b5d4f4" stroke="#378add" stroke-width="0.5"/>
+      <rect x="477.5" y="222.5" width="65" height="37.5" rx="2" fill="#b5d4f4" stroke="#378add" stroke-width="0.5"/>
+      <rect x="545.4" y="247.5" width="64.9" height="12.5" rx="2" fill="#b5d4f4" stroke="#378add" stroke-width="0.5"/>
+      <polyline points="92.4,260 160.3,238.4 250.2,195.2 285.6,170 318.2,137.6 386.1,110.6 476,94.4 515.8,89 544,83.6 583.7,81.8 611.9,80" fill="none" stroke="#1a5fb4" stroke-width="2"/>
+      <line x1="285.6" y1="170" x2="285.6" y2="260" stroke="#ba7517" stroke-width="1" stroke-dasharray="4 3"/>
+      <line x1="515.8" y1="89" x2="515.8" y2="260" stroke="#ba7517" stroke-width="1" stroke-dasharray="4 3"/>
+      <line x1="583.7" y1="81.8" x2="583.7" y2="260" stroke="#ba7517" stroke-width="1" stroke-dasharray="4 3"/>
+      <circle cx="285.6" cy="170" r="4" fill="#ba7517"/>
+      <circle cx="515.8" cy="89" r="4" fill="#ba7517"/>
+      <circle cx="583.7" cy="81.8" r="4" fill="#ba7517"/>
+      <text x="160.3" y="276" text-anchor="middle" font-size="11" fill="#5f5e5a">10</text>
+      <text x="250.2" y="276" text-anchor="middle" font-size="11" fill="#5f5e5a">25</text>
+      <text x="318.2" y="276" text-anchor="middle" font-size="11" fill="#5f5e5a">50</text>
+      <text x="386.1" y="276" text-anchor="middle" font-size="11" fill="#5f5e5a">100</text>
+      <text x="476" y="276" text-anchor="middle" font-size="11" fill="#5f5e5a">250</text>
+      <text x="544" y="276" text-anchor="middle" font-size="11" fill="#5f5e5a">500</text>
+      <text x="611.9" y="276" text-anchor="middle" font-size="11" fill="#5f5e5a">1000</text>
+      <text x="285.6" y="296" text-anchor="middle" font-size="12" fill="#8a5a00">P50 36ms</text>
+      <text x="515.8" y="296" text-anchor="middle" font-size="12" fill="#8a5a00">P95 375ms</text>
+      <text x="583.7" y="296" text-anchor="middle" font-size="12" fill="#8a5a00">P99 750ms</text>
+      <text x="76" y="318" font-size="11" fill="#888780">单次耗时 ms（对数刻度，刻度值即桶边界 le）</text>
+    </svg>
+    <figcaption>图 1　柱是"每个区间的次数"（直方图桶），折线是"累计占比"，分位数就是折线上的一个横坐标。</figcaption>
+  </figure>
+
+  <p><strong>读法</strong>：从左边 <code>50%</code> 的高度水平向右，撞到累计折线，再垂直落下来读横轴，得到 <code>P50 ≈ 36ms</code>。这就是分位数的全部含义。</p>
+
+  <p>同一次观测的三个数讲三个故事：<strong>平均耗时约 81ms、P50 ≈ 36ms、P99 ≈ 750ms</strong>。用户"典型体验"是 36ms，报表会写 81ms，而最慢那 1% 的人在等 0.75 秒。三个数都对，但只有 P99 描述了那 10 个人的绝望。</p>
+
+  <h2 id="bucket"><span class="num">02</span>直方图桶：把分布切成格子</h2>
+
+  <h3>2.1 定义</h3>
+  <p>桶（bucket）是一组<strong>预先固定</strong>的边界，每个桶记一个数：<strong>耗时小于等于该边界的调用次数</strong>。在 Prometheus 文本格式里，它长这样：</p>
+
+<pre><code>order_create_seconds_bucket{le="0.05"}  680
+order_create_seconds_bucket{le="0.1"}   830
+order_create_seconds_bucket{le="0.25"}  920
+order_create_seconds_bucket{le="+Inf"}  1000</code></pre>
+
+  <h3>2.2 四条不可动摇的规则</h3>
+  <table>
+    <thead><tr><th>规则</th><th>含义</th><th>为什么必须这样</th></tr></thead>
+    <tbody>
+      <tr><td><strong>边界固定</strong></td><td>一旦定下，每次抓取都报同一组 <code>le</code> 值</td><td>后端要能逐次对齐、桶间相减；边界漂移 = 序列不可比</td></tr>
+      <tr><td><strong>累计语义</strong></td><td><code>le="0.1"</code> 的值包含所有更小桶的次数</td><td>单调不减才能被 <code>histogram_quantile</code> 使用，也自带"≤"的语义</td></tr>
+      <tr><td><strong>自检点</strong></td><td><code>le="+Inf"</code> 必须等于 <code>_count</code></td><td>不等就说明有样本被丢弃（超时、溢出、负值）</td></tr>
+      <tr><td><strong>精度上限</strong></td><td>落在同一桶里的值<strong>无法再区分</strong></td><td>P99 的最大误差等于它所在桶的宽度</td></tr>
+    </tbody>
+  </table>
+
+  <p>最后一条是桶的根本代价：<strong>桶是有损压缩</strong>。图 1 里 P99 落在 <code>[500, 1000]</code> 这一档，跨度 500ms，所以 750ms 只是插值出来的猜测——真实值可能是 520，也可能是 980。想看清尾部，只能把桶在尾部加密。</p>
+
+  <h3>2.3 累计桶与增量桶：同一个分布，两种写法</h3>
+
+  <p>同一组数据，Prometheus 报"累计"，OTLP 报"增量"。形状完全相反，但信息等价（前提是桶边界一致）。</p>
+
+  <figure>
+    <svg viewBox="0 0 680 240" role="img" aria-labelledby="f3t f3d">
+      <title id="f3t">累计桶呈递增阶梯，增量桶呈分布形状</title>
+      <desc id="f3d">左侧 Prometheus 累计桶从 120 逐档递增到 1000，右侧 OTLP 增量桶为 120、240、320、150、90、60、20 的分布形状。</desc>
+      <text x="60" y="44" font-size="13" font-weight="600" fill="#14181f">Prometheus：累计桶</text>
+      <text x="380" y="44" font-size="13" font-weight="600" fill="#14181f">OTLP：增量桶</text>
+      <line x1="60" y1="170" x2="300" y2="170" stroke="#b4b2a9" stroke-width="0.5"/>
+      <line x1="380" y1="170" x2="620" y2="170" stroke="#b4b2a9" stroke-width="0.5"/>
+      <rect x="63" y="158" width="28" height="12" fill="#b5d4f4" stroke="#378add" stroke-width="0.5"/>
+      <rect x="97.3" y="134" width="28" height="36" fill="#b5d4f4" stroke="#378add" stroke-width="0.5"/>
+      <rect x="131.6" y="102" width="28" height="68" fill="#b5d4f4" stroke="#378add" stroke-width="0.5"/>
+      <rect x="165.9" y="87" width="28" height="83" fill="#b5d4f4" stroke="#378add" stroke-width="0.5"/>
+      <rect x="200.2" y="78" width="28" height="92" fill="#b5d4f4" stroke="#378add" stroke-width="0.5"/>
+      <rect x="234.5" y="72" width="28" height="98" fill="#b5d4f4" stroke="#378add" stroke-width="0.5"/>
+      <rect x="268.8" y="70" width="28" height="100" fill="#b5d4f4" stroke="#378add" stroke-width="0.5"/>
+      <rect x="383" y="158" width="28" height="12" fill="#b5d4f4" stroke="#378add" stroke-width="0.5"/>
+      <rect x="417.3" y="146" width="28" height="24" fill="#b5d4f4" stroke="#378add" stroke-width="0.5"/>
+      <rect x="451.6" y="138" width="28" height="32" fill="#b5d4f4" stroke="#378add" stroke-width="0.5"/>
+      <rect x="485.9" y="155" width="28" height="15" fill="#b5d4f4" stroke="#378add" stroke-width="0.5"/>
+      <rect x="520.2" y="161" width="28" height="9" fill="#b5d4f4" stroke="#378add" stroke-width="0.5"/>
+      <rect x="554.5" y="164" width="28" height="6" fill="#b5d4f4" stroke="#378add" stroke-width="0.5"/>
+      <rect x="588.8" y="168" width="28" height="2" fill="#b5d4f4" stroke="#378add" stroke-width="0.5"/>
+      <text x="77" y="186" text-anchor="middle" font-size="10" fill="#888780">10</text>
+      <text x="111.3" y="186" text-anchor="middle" font-size="10" fill="#888780">25</text>
+      <text x="145.6" y="186" text-anchor="middle" font-size="10" fill="#888780">50</text>
+      <text x="179.9" y="186" text-anchor="middle" font-size="10" fill="#888780">100</text>
+      <text x="214.2" y="186" text-anchor="middle" font-size="10" fill="#888780">250</text>
+      <text x="248.5" y="186" text-anchor="middle" font-size="10" fill="#888780">500</text>
+      <text x="282.8" y="186" text-anchor="middle" font-size="10" fill="#888780">1000</text>
+      <text x="397" y="186" text-anchor="middle" font-size="10" fill="#888780">10</text>
+      <text x="431.3" y="186" text-anchor="middle" font-size="10" fill="#888780">25</text>
+      <text x="465.6" y="186" text-anchor="middle" font-size="10" fill="#888780">50</text>
+      <text x="499.9" y="186" text-anchor="middle" font-size="10" fill="#888780">100</text>
+      <text x="534.2" y="186" text-anchor="middle" font-size="10" fill="#888780">250</text>
+      <text x="568.5" y="186" text-anchor="middle" font-size="10" fill="#888780">500</text>
+      <text x="602.8" y="186" text-anchor="middle" font-size="10" fill="#888780">1000</text>
+      <text x="60" y="210" font-size="11" fill="#6b7280">只会往上爬，末档恒等于 count</text>
+      <text x="380" y="210" font-size="11" fill="#6b7280">呈真实分布，须相加才能还原全局</text>
+    </svg>
+    <figcaption>图 2　同一组数据：累计桶单调递增（Prometheus），增量桶呈分布形状（OTLP / Datadog）。</figcaption>
+  </figure>
+
+  <table>
+    <thead><tr><th></th><th>累计桶（Prometheus）</th><th>增量桶（OTLP / Datadog）</th></tr></thead>
+    <tbody>
+      <tr><td>语义</td><td>迄今 ≤ 该边界的总次数，永远递增</td><td>本步（默认 60s）内落在该档的次数</td></tr>
+      <tr><td>相邻两档相减</td><td>得到该档的增量为负 → 无意义</td><td>得到累计量 → 无意义</td></tr>
+      <tr><td>计算分位数</td><td>后端直接 <code>histogram_quantile</code></td><td>先还原成累计，或按后端规则</td></tr>
+      <tr><td>进程重启</td><td>归零，<code>rate()</code> 出现断点</td><td>不影响（每步独立）</td></tr>
+      <tr><td>丢失一次抓取</td><td>无影响（下次仍是全量）</td><td>永久丢失该步数据</td></tr>
+    </tbody>
+  </table>
+
+  <h3>2.4 精度就是桶边界的密度</h3>
+
+  <p>假设 SLO 是 300ms，但桶边界只有 <code>250</code> 和 <code>500</code>。那么无论真实情况如何，你只能报出："P99 在 250ms 到 500ms 之间"。这不是估算误差，是<strong>信息已经丢了</strong>。</p>
+
+  <p>所以设桶的原则只有一条：<strong>把桶密集地放在你关心的区间</strong>。做法有两个：</p>
+  <ul>
+    <li>设 <code>serviceLevelObjectives</code>（SLO 边界），只在你真正要考核的档位加密，成本最低；</li>
+    <li>收窄 <code>minimumExpectedValue</code> / <code>maximumExpectedValue</code>，让自动生成的桶落在有效区间内（见 2.5）。</li>
+  </ul>
+
+  <h3>2.5 Micrometer 的桶是从哪来的</h3>
+
+  <p>Micrometer 不动态学习分布，而是用一张<strong>预生成的固定桶表</strong>，按配置的 <code>[min, max]</code> 切片：</p>
+
+  <ul>
+    <li>桶表的生成规则：以 4 的幂为骨架，中间按"上一次幂的 1/3"等距插值，再补上 <code>+Inf</code>。所以真实的桶是 <code>1, 2, 3, 4, 5, ... 14, 16, 21, 26, ...</code> 这种形状，不是整齐的 1/2/5 序列。</li>
+    <li>切片区间由 <code>minimumExpectedValue</code> 和 <code>maximumExpectedValue</code> 决定：区间越宽，桶越多。</li>
+  </ul>
+
+  <div class="callout warn">
+    <span class="label">最常踩的坑</span>
+    <p><code>DistributionStatisticConfig</code> 的 <code>maximumExpectedValue</code> 默认是 <code>+Infinity</code>。这意味着切片几乎等于整张桶表，单个 <code>publishPercentileHistogram()</code> 就能让一条 Timer 膨胀出上百个桶——序列数直接涨一个数量级。正确做法是<strong>同时显式设定 min 和 max</strong>（例如 1ms ~ 5s），让切片落在几十个桶。</p>
+  </div>
+
+  <h3>2.6 桶的成本可以算出来</h3>
+
+  <p>一条 Timer 在 Prometheus 里占用的序列数：</p>
+<pre><code>序列数 = 标签组合数 × (桶数 + 3)      // +3 是 _count / _sum / _max</code></pre>
+
+  <p>举例：<code>http.server.requests</code> 有 20 个 uri × 5 个 method × 6 个 status = 600 个标签组合，桶数 73，则</p>
+<pre><code>600 × (73 + 3) = 45 600 条序列</code></pre>
+
+  <p>这就是为什么"随手开个直方图"在小集群上没感觉，在大集群上能压垮 Prometheus。桶是<strong>用存储换分辨率</strong>，本质上是笔预算。</p>
+
+  <h2 id="percentile"><span class="num">03</span>分位数：在曲线上读一个位置</h2>
+
+  <h3>3.1 定义</h3>
+
+  <p>P99 的严格定义是：<strong>把样本按大小排序后，第 99% 个位置上的那个值</strong>。它回答的是"最慢的那 1% 从哪里开始"，而不是"平均有多慢"。</p>
+
+  <p>几个常用档位各自回答不同的问题：</p>
+
+  <table>
+    <thead><tr><th>档位</th><th>回答的问题</th><th>典型用途</th></tr></thead>
+    <tbody>
+      <tr><td><code>P50</code></td><td>一半请求快于多少</td><td>典型用户体验；与 P99 对照判断"整体变慢"还是"局部受害"</td></tr>
+      <tr><td><code>P90</code></td><td>开始进入慢区间的门槛</td><td>前端渲染、首屏体验基线</td></tr>
+      <tr><td><code>P95</code></td><td>尾部从哪里开始</td><td>常规 SLI、日常告警</td></tr>
+      <tr><td><code>P99</code></td><td>长尾有多长</td><td>SLO 考核、容量规划、下游依赖评估</td></tr>
+      <tr><td><code>P999</code></td><td>极端尾部</td><td>GC 停顿、锁竞争、网络抖动定位</td></tr>
+      <tr><td><code>MAX</code></td><td>历史上发生过的最坏一次</td><td>故障复盘；<strong>不适合告警</strong>（单点极值，抖动大）</td></tr>
+    </tbody>
+  </table>
+
+  <h3>3.2 为什么不用平均值</h3>
+
+  <p>1000 次调用，其中 980 次 10ms、20 次 5s（比如每 50 次有一次缓存击穿）：</p>
+
+  <table>
+    <thead><tr><th>指标</th><th>值</th><th>它让你以为什么</th></tr></thead>
+    <tbody>
+      <tr><td>平均值</td><td>(980×10 + 20×5000) / 1000 = <strong>110ms</strong></td><td>"还行，稍微慢一点"</td></tr>
+      <tr><td>P50</td><td><strong>10ms</strong></td><td>"绝大多数请求非常快"</td></tr>
+      <tr><td>P99</td><td><strong>5s</strong></td><td>"每 50 个用户就有一个在等 5 秒"</td></tr>
+    </tbody>
+  </table>
+
+  <p>平均值被头部拉低、又被尾部拉高，两头抵消成一个"看起来无害"的数字。<strong>平均值是唯一一个既不代表典型用户、也不代表最差用户的指标。</strong></p>
+
+  <h3>3.3 三个必须纠正的误读</h3>
+
+  <div class="callout">
+    <span class="label">误读一</span>
+    <p>"P99 = 99% 的请求快于这个值"。严格说是"第 99 百分位上的观测值"。用桶计算时还会在桶内做线性插值，所以它天然带误差，且误差上限就是桶宽。</p>
+  </div>
+
+  <div class="callout">
+    <span class="label">误读二</span>
+    <p>"把多个实例的 P99 平均就是全局 P99"。这是本文最需要记住的一条，见 3.5。</p>
+  </div>
+
+  <div class="callout">
+    <span class="label">误读三</span>
+    <p>"只看 P99 就够了"。P50 与 P99 同时抬升 = 整体变慢（资源不足、全量慢查询）；只有 P99 抬升而 P50 平稳 = 部分请求受害（下游抖动、GC、连接池争抢）。两者的组合才是诊断信息。</p>
+  </div>
+
+  <h3>3.4 两条实现路线</h3>
+
+  <table>
+    <thead><tr><th></th><th>客户端分位数</th><th>聚合直方图</th></tr></thead>
+    <tbody>
+      <tr><td>Micrometer 开关</td><td><code>publishPercentiles(0.5, 0.99)</code></td><td><code>publishPercentileHistogram()</code> 或设 SLO</td></tr>
+      <tr><td>存储的是什么</td><td>每实例一个 HdrHistogram，采集时算成几个数</td><td>固定边界上的桶计数</td></tr>
+      <tr><td>产出形态</td><td><code>..._seconds{quantile="0.99"}</code></td><td><code>..._seconds_bucket{le="0.5"}</code></td></tr>
+      <tr><td>精度</td><td>高（受 <code>percentilePrecision</code> 影响）</td><td>受桶边界限制</td></tr>
+      <tr><td>内存</td><td>每实例一份直方图，较重</td><td>固定（桶数 × 计数器）</td></tr>
+      <tr><td>跨实例聚合</td><td><strong>不能</strong></td><td><strong>能</strong>（桶可相加）</td></tr>
+      <tr><td>适用</td><td>单实例诊断、离线分析</td><td>服务端 SLO、多实例面板、告警</td></tr>
+    </tbody>
+  </table>
+
+  <h3>3.5 分位数为什么不可平均</h3>
+
+  <p>三个实例等流量，各 1000 次请求，实例 C 有 1% 的请求慢到 1 秒：</p>
+
+  <div class="chips">
+    <span class="chip">实例 A · P99 = 100ms</span>
+    <span class="chip">实例 B · P99 = 100ms</span>
+    <span class="chip">实例 C · P99 = 1000ms</span>
+  </div>
+
+  <div class="cards">
+    <div class="card bad">
+      <div class="tag">把 P99 直接平均</div>
+      <div class="big">400ms</div>
+      <p>(100 + 100 + 1000) / 3。但合并后 3000 次请求里只有 10 次落在 1 秒，第 2970 位仍落在 100ms 那档——真实全局 P99 是 100ms，误差 4 倍。</p>
+    </div>
+    <div class="card good">
+      <div class="tag">把桶相加再重算</div>
+      <div class="big">≈ 100ms</div>
+      <p>3000 次请求的桶逐档相加，重新找第 2970 位。这是唯一正确的"全局 P99"，也是它必须建在桶上的原因。</p>
+    </div>
+  </div>
+
+  <p><strong>为什么</strong>：分位数只记录"某个位置的值"，丢掉了"这个位置前后各有多少样本"。合并两个分布时，你需要的是每个区间的<em>数量</em>，而不是两个孤立的位置坐标。这就是分位数不可加、不可平均、不可跨时间求和的数学根源。</p>
+
+  <p>推论：以下操作<strong>全部是错的</strong>，而且错得静默——不会报错，只会给你一个看起来很合理的数字。</p>
+
+  <ul>
+    <li>多实例 P99 取平均（或取最大）</li>
+    <li>按分钟算 P99，再对 24 小时取平均求"日 P99"</li>
+    <li>按机房算 P99，再线性组合成"全国 P99"</li>
+  </ul>
+
+  <h2 id="micrometer"><span class="num">04</span>在 Micrometer 里怎么配</h2>
+
+  <h3>4.1 三个开关，三种产出</h3>
+
+  <table>
+    <thead><tr><th>配置</th><th>产出</th><th>能跨实例聚合</th><th>用途</th></tr></thead>
+    <tbody>
+      <tr><td><code>publishPercentiles(0.5, 0.95, 0.99)</code></td><td><code>{quantile="0.99"}</code></td><td>不能</td><td>单机诊断</td></tr>
+      <tr><td><code>publishPercentileHistogram()</code></td><td><code>_bucket{le="..."}</code></td><td>能</td><td>服务端首选</td></tr>
+      <tr><td><code>serviceLevelObjectives(...)</code></td><td>少量指定 <code>_bucket</code></td><td>能</td><td>SLO 达标率，成本最低</td></tr>
+      <tr><td>都不开（默认）</td><td>仅 <code>_count / _sum / _max</code></td><td>—</td><td>只能算平均和 QPS</td></tr>
+    </tbody>
+  </table>
+
+  <h3>4.2 三种注解写法</h3>
+
+<pre><code>@Timed(value = "order.create", histogram = true)                        // → _bucket，生产首选
+@Timed(value = "order.create", percentiles = {0.5, 0.99})               // → quantile 序列，单机诊断
+@Timed(value = "order.create", serviceLevelObjectives = {0.1, 0.3, 1})  // → 只在 100ms / 300ms / 1s 三档有桶</code></pre>
+
+  <h3>4.3 生产推荐配置</h3>
+
+  <p>给 HTTP 指标配一组"边界密在有效区间"的桶，同时把所有 Timer 的默认上界收窄——这一步能直接省掉一半序列数：</p>
+
+<pre><code>@Bean
+MeterFilter httpDistribution() {
+    return MeterFilter.configure(
+        "http.server.requests",
+        DistributionStatisticConfig.builder()
+            .minimumExpectedValue(Duration.ofMillis(1))
+            .maximumExpectedValue(Duration.ofSeconds(5))
+            .serviceLevelObjectives(
+                Duration.ofMillis(100),
+                Duration.ofMillis(300),
+                Duration.ofSeconds(1))
+            .build());
+}
+
+@Bean
+MeterFilter shrinkDefaultHistogram() {
+    return MeterFilter.configure(
+        DistributionStatisticConfig.builder()
+            .maximumExpectedValue(Duration.ofSeconds(10))
+            .build());
+}</code></pre>
+
+  <div class="callout rule">
+    <span class="label">为什么这样配</span>
+    <p><code>serviceLevelObjectives</code> 会在最终桶集合里额外注入这三个边界，所以即使自动生成的桶不密，SLO 那三档永远精确——"P99 是否超过 300ms"这个问题能被明确回答，而不是"在 250 到 500 之间"。</p>
+  </div>
+
+  <h3>4.4 查询对照</h3>
+
+  <table>
+    <thead><tr><th>想看什么</th><th>PromQL</th></tr></thead>
+    <tbody>
+      <tr><td>QPS</td><td><code>sum(rate(http_server_requests_seconds_count[1m]))</code></td></tr>
+      <tr><td>平均耗时</td><td><code>sum(rate(..._sum[5m])) / sum(rate(..._count[5m]))</code></td></tr>
+      <tr><td>全局 P99</td><td><code>histogram_quantile(0.99, sum by (le) (rate(..._bucket[5m])))</code></td></tr>
+      <tr><td>SLO 达标率</td><td><code>sum(rate(..._bucket{le="0.3"}[5m])) / sum(rate(..._count[5m]))</code></td></tr>
+      <tr><td>单实例 P99（不聚合）</td><td><code>...{quantile="0.99"}</code>，只能按 instance 分别看</td></tr>
+    </tbody>
+  </table>
+
+  <p>注意 P99 那条必须带 <code>sum by (le)</code>：先把所有实例、所有 uri、所有 status 的<strong>桶</strong>加起来，再算分位。少写一个 <code>by (le)</code>，Prometheus 会逐序列算分位，得到的是一堆单实例 P99，不是全局值。</p>
+
+  <h2 id="pitfalls"><span class="num">05</span>五个高频误用</h2>
+
+  <ol>
+    <li><strong>把 P99 做平均</strong>。多实例、多机房、按时间的 P99 一律不可平均（3.5 已证）。要全局 P99 只能存桶。</li>
+    <li><strong>以为 P99 是"99% 的请求快于此值"</strong>。严格说是"第 99 百分位的观测值"；用桶算时还会在桶内线性插值，天然带误差。</li>
+    <li><strong>桶边界定得太糙</strong>。SLO 是 300ms，桶边界却只有 250 和 500，那你永远只能报一个区间。桶边界就是观测分辨率。</li>
+    <li><strong>percentiles 与 histogram 同时开</strong>。前者每实例一份 HdrHistogram（重），后者每序列几十上百条时间序列（贵）。Prometheus 场景只开 histogram。</li>
+    <li><strong>只看 <code>_max</code> 当尾部</strong>。<code>_max</code> 是窗口内的单点极值，会被单个异常样本污染；P99 才是稳定的尾部指标。</li>
+  </ol>
+
+  <h3>上线前检查清单</h3>
+  <ul class="check">
+    <li>所有告警与 SLO 都建在 <code>_bucket</code> 上，没有一条建在 <code>quantile</code> 上</li>
+    <li>桶的 <code>maximumExpectedValue</code> 已显式设置（不是默认的 <code>+Infinity</code>）</li>
+    <li>SLO 边界确实出现在 <code>_bucket{le=...}</code> 里（抓一次 <code>/actuator/prometheus</code> 确认）</li>
+    <li>P99 查询带 <code>sum by (le)</code>，且分母用 <code>rate(_count)</code></li>
+    <li>算过序列数预算：标签组合数 × (桶数 + 3)</li>
+  </ul>
+
+  <h2 id="appendix"><span class="num">06</span>附录：1000 次调用的完整算例</h2>
+
+  <p>图 1 的数据如下（<code>le</code> 单位 ms）：</p>
+
+  <table>
+    <thead><tr><th>le（ms）</th><th>本档次数</th><th>累计次数</th><th>累计占比</th></tr></thead>
+    <tbody>
+      <tr><td>10</td><td>120</td><td>120</td><td>12%</td></tr>
+      <tr><td>25</td><td>240</td><td>360</td><td>36%</td></tr>
+      <tr><td>50</td><td>320</td><td>680</td><td>68%</td></tr>
+      <tr><td>100</td><td>150</td><td>830</td><td>83%</td></tr>
+      <tr><td>250</td><td>90</td><td>920</td><td>92%</td></tr>
+      <tr><td>500</td><td>60</td><td>980</td><td>98%</td></tr>
+      <tr><td>1000</td><td>20</td><td>1000</td><td>100%</td></tr>
+      <tr><td>+Inf</td><td>0</td><td>1000</td><td>100%</td></tr>
+    </tbody>
+  </table>
+
+  <p>计算分位数的三步（这正是 <code>histogram_quantile</code> 做的事）：</p>
+
+  <ol>
+    <li>目标排位 = <code>分位点 × 总数</code>：P99 → <code>0.99 × 1000 = 990</code>。</li>
+    <li>定位桶：在累计列里找到第一个 ≥ 990 的值，得到桶 <code>(500, 1000]</code>。</li>
+    <li>桶内线性插值：<code>500 + (990 − 980) / (1000 − 980) × (1000 − 500) = 750ms</code>。</li>
+  </ol>
+
+  <p>同理：</p>
+  <ul>
+    <li><code>P50</code>：排位 500，落在 <code>(25, 50]</code>，桶内比例 <code>(500−360)/320 = 0.4375</code>，得 <code>25 + 0.4375×25 ≈ 35.9ms</code>。</li>
+    <li><code>P95</code>：排位 950，落在 <code>(250, 500]</code>，比例 <code>(950−920)/60 = 0.5</code>，得 <code>250 + 0.5×250 = 375ms</code>。</li>
+    <li>平均：用各档中点估算 <code>≈ 81ms</code>；精确值需 <code>_sum / _count</code>。</li>
+  </ul>
+
+  <div class="callout warn">
+    <span class="label">一个静默的边界情况</span>
+    <p>如果分位数落在 <code>le="+Inf"</code> 那一档（即最高边界仍然不够高），Prometheus 的 <code>histogram_quantile</code> 会返回 <code>+Inf</code> 或 <code>NaN</code>，面板上表现为一根断线或一个空点。这几乎总是意味着 <code>maximumExpectedValue</code> 设小了——不要以为是查询写错了。</p>
+  </div>
+
+  <footer>
+    <strong>相关文档</strong>
+    <ul>
+      <li><a href="./Micrometer&amp;Tracing抽象设计.md">Micrometer&amp;Tracing 抽象设计</a> —— 第 8 章「单指标解剖：@Timed 到底积累了什么」</li>
+      <li><a href="./Micrometer.md">Micrometer 深度源码解析</a> —— 第四章「分布统计内核：P99 是怎么算出来的」</li>
+      <li><a href="./观测体系.md">观测体系：现状架构分析</a> —— 指标链归属与断点清单</li>
+    </ul>
+  </footer>
+
+  </main>
+</div>
+
+<script>
+(function () {
+  var list = document.getElementById('outline-list');
+  if (!list) return;
+
+  // 1. 给缺少 id 的 h3 补锚点，并收集层级
+  var heads = [].slice.call(document.querySelectorAll('.page h2, .page h3'));
+  var items = [];
+  var curH2 = 'sec';
+  var seq = 0;
+  heads.forEach(function (h) {
+    if (h.tagName === 'H2') {
+      curH2 = h.id || ('sec-' + (++seq));
+      h.id = curH2;
+      var numEl = h.querySelector('.num');
+      var num = numEl ? numEl.textContent.trim() : '';
+      var text = h.textContent.trim().slice(num.length).trim();
+      items.push({ el: h, level: 1, href: '#' + curH2, num: num, text: text });
+      seq = 0;
+    } else {
+      if (!h.id) h.id = curH2 + '-h' + (++seq);
+      items.push({ el: h, level: 2, href: '#' + h.id, num: '', text: h.textContent.trim() });
+    }
+  });
+
+  // 2. 渲染完整大纲（覆盖静态回退内容）
+  var frag = document.createDocumentFragment();
+  items.forEach(function (it) {
+    var li = document.createElement('li');
+    li.className = it.level === 1 ? 'lvl1' : 'lvl2';
+    var a = document.createElement('a');
+    a.href = it.href;
+    if (it.num) {
+      var s = document.createElement('span');
+      s.className = 'o-num';
+      s.textContent = it.num;
+      a.appendChild(s);
+    }
+    a.appendChild(document.createTextNode(it.text));
+    li.appendChild(a);
+    frag.appendChild(li);
+  });
+  list.innerHTML = '';
+  list.appendChild(frag);
+
+  var links = [].slice.call(list.querySelectorAll('a'));
+  var aside = document.querySelector('.outline');
+
+  // 3. 滚动高亮：取最后一个越过参考线的标题
+  var current = -1;
+  function sync() {
+    var line = 140;
+    var idx = 0;
+    for (var i = 0; i < items.length; i++) {
+      if (items[i].el.getBoundingClientRect().top <= line) idx = i;
+      else break;
+    }
+    // 滚到底时强制高亮最后一项
+    if (window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 4) {
+      idx = items.length - 1;
+    }
+    if (idx === current) return;
+    current = idx;
+    links.forEach(function (a, i) { a.classList.toggle('active', i === idx); });
+    // 侧栏不可见（窄屏）时不做自动滚动，避免带动页面
+    if (!aside || !aside.offsetParent) return;
+    var active = links[idx];
+    if (!active) return;
+    var box = active.getBoundingClientRect();
+    var ob = aside.getBoundingClientRect();
+    if (box.top < ob.top + 40 || box.bottom > ob.bottom - 20) {
+      aside.scrollTop += box.top - ob.top - ob.height / 2;
+    }
+  }
+
+  var ticking = false;
+  function onScroll() {
+    if (ticking) return;
+    ticking = true;
+    requestAnimationFrame(function () { ticking = false; sync(); });
+  }
+  window.addEventListener('scroll', onScroll, { passive: true });
+  window.addEventListener('resize', onScroll);
+  window.addEventListener('hashchange', function () { setTimeout(sync, 80); });
+  sync();
+})();
+</script>
+</body>
+</html>
